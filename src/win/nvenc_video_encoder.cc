@@ -13,7 +13,10 @@
 #include <utility>
 #include <vector>
 
+#include "api/scoped_refptr.h"
+#include "api/video/encoded_image.h"
 #include "api/video/i420_buffer.h"
+#include "api/video/video_frame.h"
 #include "api/video/video_frame_buffer.h"
 #include "api/video_codecs/video_codec.h"
 #include "common_video/h264/h264_bitstream_parser.h"
@@ -193,7 +196,7 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   ~NvencH264Encoder() override { Release(); }
 
   int InitEncode(const webrtc::VideoCodec* codec_settings,
-                 const webrtc::VideoEncoder::Settings& settings) override {
+                 const webrtc::VideoEncoder::Settings& /* settings */) override {
     if (codec_settings == nullptr ||
         codec_settings->codecType != webrtc::kVideoCodecH264) {
       return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
@@ -504,7 +507,6 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     image.timing_.flags = webrtc::VideoSendTiming::kInvalid;
     image._frameType = key_frame ? webrtc::VideoFrameType::kVideoFrameKey
                                  : webrtc::VideoFrameType::kVideoFrameDelta;
-    image.set_end_of_temporal_unit(true);
 
     bitstream_parser_.ParseBitstream(image);
     image.qp_ = bitstream_parser_.GetLastSliceQp().value_or(-1);
