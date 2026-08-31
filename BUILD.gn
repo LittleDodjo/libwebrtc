@@ -214,8 +214,12 @@ rtc_shared_library("libwebrtc") {
   # драйвером NVIDIA и грузится в рантайме.
   if (is_win) {
     sources += [
+      "src/win/mf_video_decoder.cc",
+      "src/win/mf_video_decoder.h",
       "src/win/nvenc_video_encoder.cc",
       "src/win/nvenc_video_encoder.h",
+      "src/win/squeak_video_decoder_factory.cc",
+      "src/win/squeak_video_decoder_factory.h",
       "src/win/squeak_video_encoder_factory.cc",
       "src/win/squeak_video_encoder_factory.h",
     ]
@@ -223,6 +227,10 @@ rtc_shared_library("libwebrtc") {
     libs += [
       "d3d11.lib",
       "dxgi.lib",
+      "mf.lib",
+      "mfplat.lib",
+      "mfuuid.lib",
+      "strmiids.lib",
     ]
   }
 

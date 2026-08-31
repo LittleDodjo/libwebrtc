@@ -24,6 +24,7 @@
 #include "engine/sdk/objc/Framework/Classes/videotoolboxvideocodecfactory.h"
 #endif
 #if defined(SQUEAK_USE_NVENC)
+#include "src/win/squeak_video_decoder_factory.h"
 #include "src/win/squeak_video_encoder_factory.h"
 #endif
 #include <api/task_queue/default_task_queue_factory.h>
@@ -90,7 +91,7 @@ bool RTCPeerConnectionFactoryImpl::Initialize() {
         CreateIntelVideoEncoderFactory(), CreateIntelVideoDecoderFactory(),
 #elif defined(SQUEAK_USE_NVENC)
         squeak::CreateSqueakVideoEncoderFactory(),
-        webrtc::CreateBuiltinVideoDecoderFactory(),
+        squeak::CreateSqueakVideoDecoderFactory(),
 #else
         webrtc::CreateBuiltinVideoEncoderFactory(),
         webrtc::CreateBuiltinVideoDecoderFactory(),
