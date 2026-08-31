@@ -73,8 +73,11 @@ const NvencApi& GetNvencApi() {
       return result;
     }
     result->fn.version = NV_ENCODE_API_FUNCTION_LIST_VER;
-    if (create(&result->fn) != NV_ENC_SUCCESS) {
-      RTC_LOG(LS_WARNING) << "NVENC: NvEncodeAPICreateInstance failed";
+    const NVENCSTATUS status = create(&result->fn);
+    if (status != NV_ENC_SUCCESS) {
+      // NV_ENC_ERR_INVALID_VERSION (15) означает, что драйвер старее заголовка,
+      // с которым мы собраны, — самая частая причина отказа на живых машинах.
+      RTC_LOG(LS_WARNING) << "NVENC: NvEncodeAPICreateInstance status=" << status;
       return result;
     }
     result->loaded = true;
@@ -132,7 +135,10 @@ class NvencSession {
     params.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
     params.device = device_.Get();
     params.apiVersion = NVENCAPI_VERSION;
-    if (api.fn.nvEncOpenEncodeSessionEx(&params, &encoder_) != NV_ENC_SUCCESS) {
+    const NVENCSTATUS status =
+        api.fn.nvEncOpenEncodeSessionEx(&params, &encoder_);
+    if (status != NV_ENC_SUCCESS) {
+      RTC_LOG(LS_WARNING) << "NVENC: nvEncOpenEncodeSessionEx status=" << status;
       encoder_ = nullptr;
       return false;
     }
