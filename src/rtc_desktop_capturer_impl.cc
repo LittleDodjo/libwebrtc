@@ -48,6 +48,12 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
     options_.set_allow_pipewire(true);
   }
 #endif
+#ifdef WEBRTC_WIN
+  if (type == kScreen) {
+    gpu_capturer_ = squeak::GpuScreenCapturer::Create(source_id);
+  }
+  if (gpu_capturer_ != nullptr) return;
+#endif
   thread_->BlockingCall([this, type, showCursor] {
     if (type == kScreen) {
       if (showCursor) {
@@ -67,6 +73,9 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
 RTCDesktopCapturerImpl::~RTCDesktopCapturerImpl() {
   thread_->Stop();
   capturer_.reset();
+#ifdef WEBRTC_WIN
+  gpu_capturer_.reset();
+#endif
 }
 
 RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
@@ -98,6 +107,17 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
   } else {
     capture_delay_ = uint32_t(1000.0 / fps);
   }
+
+#ifdef WEBRTC_WIN
+  if (gpu_capturer_ != nullptr) {
+    capture_state_ = CS_RUNNING;
+    thread_->PostTask([this] { CaptureFrame(); });
+    if (observer_) {
+      signaling_thread_->BlockingCall([&, this]() { observer_->OnStart(this); });
+    }
+    return capture_state_;
+  }
+#endif
 
   if (source_id_ != -1) {
     if (!capturer_->SelectSource(source_id_)) {
@@ -219,6 +239,19 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
 void RTCDesktopCapturerImpl::CaptureFrame() {
   RTC_DCHECK_RUN_ON(thread_.get());
   if (capture_state_ == CS_RUNNING) {
+#ifdef WEBRTC_WIN
+    if (gpu_capturer_ != nullptr) {
+      auto buffer = gpu_capturer_->Capture();
+      if (buffer != nullptr) {
+        OnFrame(webrtc::VideoFrame(buffer, 0, webrtc::TimeMillis(),
+                                   webrtc::kVideoRotation_0));
+      }
+      thread_->PostDelayedHighPrecisionTask(
+          [this]() { CaptureFrame(); },
+          webrtc::TimeDelta::Millis(capture_delay_));
+      return;
+    }
+#endif
     capturer_->CaptureFrame();
     thread_->PostDelayedHighPrecisionTask(
         [this]() { CaptureFrame(); },
