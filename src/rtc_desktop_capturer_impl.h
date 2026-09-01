@@ -28,6 +28,9 @@
 #include "rtc_base/thread.h"
 #include "src/internal/vcm_capturer.h"
 #include "src/internal/video_capturer.h"
+#ifdef WEBRTC_WIN
+#include "src/win/gpu_screen_capturer.h"
+#endif
 
 namespace libwebrtc {
 
@@ -65,6 +68,11 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
 
  private:
   void CaptureFrame();
+#ifdef WEBRTC_WIN
+  // Заполнен только для захвата экрана и только если Desktop Duplication
+  // поднялась: тогда путь webrtc с обратным чтением BGRA не используется вовсе.
+  std::unique_ptr<squeak::GpuScreenCapturer> gpu_capturer_;
+#endif
   webrtc::DesktopCaptureOptions options_;
   std::unique_ptr<webrtc::DesktopCapturer> capturer_;
   std::unique_ptr<webrtc::Thread> thread_;
