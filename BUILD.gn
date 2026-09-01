@@ -214,6 +214,8 @@ rtc_shared_library("libwebrtc") {
   # драйвером NVIDIA и грузится в рантайме.
   if (is_win) {
     sources += [
+      "src/win/gpu_screen_capturer.cc",
+      "src/win/gpu_screen_capturer.h",
       "src/win/mf_video_decoder.cc",
       "src/win/mf_video_decoder.h",
       "src/win/mf_video_encoder.cc",
