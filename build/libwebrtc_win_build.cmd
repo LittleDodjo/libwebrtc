@@ -113,10 +113,16 @@ call gn.bat gen %OUTPUT_DIR% --root="src" ^
 
 rem build
 ninja.exe -C %OUTPUT_DIR% libwebrtc
+if errorlevel 1 (
+  echo ninja failed
+  exit /b 1
+)
 
 rem copy static library for release build
 copy "%OUTPUT_DIR%\libwebrtc.dll.lib" "%ARTIFACTS_DIR%\lib"
+if errorlevel 1 exit /b 1
 copy "%OUTPUT_DIR%\libwebrtc.dll" "%ARTIFACTS_DIR%\lib"
+if errorlevel 1 exit /b 1
 
 rem copy license
 copy "src\libwebrtc\LICENSE" "%ARTIFACTS_DIR%\"
