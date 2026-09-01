@@ -223,10 +223,79 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
       if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype))) continue;
       if (subtype != MFVideoFormat_NV12) continue;
 
-      if (SUCCEEDED(transform_->SetOutputType(0, type.Get(), 0))) return true;
+      if (FAILED(transform_->SetOutputType(0, type.Get(), 0))) continue;
+
+      // Геометрию читаем с ТЕКУЩЕГО типа, а не с предложенного: MFT его
+      // дополняет (апертура, шаг). Без этого шага размеры остаются теми, что
+      // угаданы в Configure, и любой поток другого разрешения превращается в
+      // кашу.
+      ComPtr<IMFMediaType> current;
+      if (SUCCEEDED(transform_->GetOutputCurrentType(0, &current))) {
+        UpdateGeometry(current.Get());
+      } else {
+        UpdateGeometry(type.Get());
+      }
+      return true;
     }
     RTC_LOG(LS_WARNING) << "MF: NV12 на выходе не предложен";
     return false;
+  }
+
+  // Видимая часть кадра почти никогда не совпадает с поверхностью: H.264
+  // кодирует макроблоками 16x16, поэтому 1920x1080 лежит в буфере 1920x1088, а
+  // 760x488 — в 768x496. Лишние строки и столбцы — это те самые зелёные полосы,
+  // если считать их частью картинки.
+  void UpdateGeometry(IMFMediaType* type) {
+    UINT32 frame_width = 0;
+    UINT32 frame_height = 0;
+    if (SUCCEEDED(::MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &frame_width,
+                                       &frame_height))) {
+      aligned_width_ = static_cast<int>(frame_width);
+      aligned_height_ = static_cast<int>(frame_height);
+      width_ = aligned_width_;
+      height_ = aligned_height_;
+    }
+    crop_x_ = 0;
+    crop_y_ = 0;
+
+    MFVideoArea area = {};
+    UINT32 blob_size = 0;
+    if (SUCCEEDED(type->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE,
+                                reinterpret_cast<UINT8*>(&area), sizeof(area),
+                                &blob_size)) &&
+        blob_size >= sizeof(area)) {
+      const int visible_width = static_cast<int>(area.Area.cx);
+      const int visible_height = static_cast<int>(area.Area.cy);
+      if (visible_width > 0 && visible_height > 0 &&
+          visible_width <= aligned_width_ &&
+          visible_height <= aligned_height_) {
+        width_ = visible_width;
+        height_ = visible_height;
+        crop_x_ = area.OffsetX.value;
+        crop_y_ = area.OffsetY.value;
+      }
+    }
+
+    // Шаг строки: сначала то, что объявил тип, иначе штатный расчёт для NV12.
+    LONG stride = 0;
+    UINT32 declared = 0;
+    if (SUCCEEDED(type->GetUINT32(MF_MT_DEFAULT_STRIDE, &declared))) {
+      stride = static_cast<LONG>(static_cast<INT32>(declared));
+    }
+    if (stride == 0) {
+      ::MFGetStrideForBitmapInfoHeader(MFVideoFormat_NV12.Data1, aligned_width_,
+                                       &stride);
+    }
+    // MFT не обязан объявлять размер поверхности до первого кадра — тогда
+    // считаем её равной видимой части: хуже, чем есть, от этого не станет.
+    if (aligned_width_ < width_) aligned_width_ = width_;
+    if (aligned_height_ < height_) aligned_height_ = height_;
+    default_stride_ = stride != 0 ? stride : aligned_width_;
+
+    RTC_LOG(LS_INFO) << "MF: геометрия " << width_ << "x" << height_
+                     << " (поверхность " << aligned_width_ << "x"
+                     << aligned_height_ << ", шаг " << default_stride_
+                     << ", смещение " << crop_x_ << "," << crop_y_ << ")";
   }
 
   bool WrapEncodedImage(const webrtc::EncodedImage& input,
@@ -281,26 +350,95 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
     }
   }
 
+  enum class LockKind { kNone, k2DSize, k2D, kFlat };
+
   void EmitFrame(IMFSample* sample, const webrtc::EncodedImage& input) {
+    if (width_ <= 0 || height_ <= 0) return;
+    if (aligned_height_ < height_ || aligned_width_ < width_) return;
+
     ComPtr<IMFMediaBuffer> buffer;
-    if (FAILED(sample->ConvertToContiguousBuffer(&buffer))) return;
+    if (FAILED(sample->GetBufferByIndex(0, &buffer))) return;
 
-    BYTE* data = nullptr;
+    // Шаг строки задаёт САМ буфер, а не ширина кадра: у декодера он выровнен
+    // под железо. Поэтому сначала пробуем 2D-интерфейсы, которые его отдают,
+    // и только в крайнем случае падаем на плоский буфер с шагом из типа.
+    ComPtr<IMF2DBuffer2> two_d2;
+    ComPtr<IMF2DBuffer> two_d;
+    BYTE* scanline0 = nullptr;
+    LONG pitch = 0;
     DWORD length = 0;
-    if (FAILED(buffer->Lock(&data, nullptr, &length))) return;
+    LockKind lock = LockKind::kNone;
 
-    // MFT отдаёт NV12 одним куском: плоскость Y, следом чередующаяся UV.
-    const int stride = width_;
-    const uint8_t* y = data;
-    const uint8_t* uv = data + static_cast<size_t>(stride) * height_;
+    BYTE* buffer_start = nullptr;
+    if (SUCCEEDED(buffer.As(&two_d2)) &&
+        SUCCEEDED(two_d2->Lock2DSize(MF2DBuffer_LockFlags_Read, &scanline0,
+                                     &pitch, &buffer_start, &length))) {
+      lock = LockKind::k2DSize;
+    } else if (SUCCEEDED(buffer.As(&two_d)) &&
+               SUCCEEDED(two_d->Lock2D(&scanline0, &pitch))) {
+      lock = LockKind::k2D;
+    } else {
+      ComPtr<IMFMediaBuffer> contiguous;
+      if (FAILED(sample->ConvertToContiguousBuffer(&contiguous))) return;
+      if (FAILED(contiguous->Lock(&scanline0, nullptr, &length))) return;
+      buffer = contiguous;
+      pitch = default_stride_;
+      lock = LockKind::kFlat;
+    }
+
+    const auto unlock = [&] {
+      switch (lock) {
+        case LockKind::k2DSize:
+          two_d2->Unlock2D();
+          break;
+        case LockKind::k2D:
+          two_d->Unlock2D();
+          break;
+        case LockKind::kFlat:
+          buffer->Unlock();
+          break;
+        case LockKind::kNone:
+          break;
+      }
+    };
+
+    // Перевёрнутый кадр от декодера не приходит; если пришёл — лучше пропустить,
+    // чем показать мусор.
+    if (pitch <= 0) {
+      RTC_LOG(LS_WARNING) << "MF: неожиданный шаг строки " << pitch;
+      unlock();
+      return;
+    }
+
+    const size_t stride = static_cast<size_t>(pitch);
+    // UV начинается после ВЫРОВНЕННОЙ высоты. Отсчёт от видимой высоты сдвигал
+    // цветность на строки выравнивания — отсюда зелёная полоса и расчёска.
+    const size_t uv_offset = stride * static_cast<size_t>(aligned_height_);
+    const size_t needed =
+        uv_offset + stride * static_cast<size_t>((aligned_height_ + 1) / 2);
+    if (length != 0 && length < needed) {
+      RTC_LOG(LS_WARNING) << "MF: буфер " << length << " меньше нужных "
+                          << needed;
+      unlock();
+      return;
+    }
+
+    // Смещения чётные: у NV12 одна пара цветности на два пикселя по обеим осям.
+    const int crop_x = crop_x_ & ~1;
+    const int crop_y = crop_y_ & ~1;
+    const uint8_t* y = scanline0 + stride * static_cast<size_t>(crop_y) +
+                       static_cast<size_t>(crop_x);
+    const uint8_t* uv = scanline0 + uv_offset +
+                        stride * static_cast<size_t>(crop_y / 2) +
+                        static_cast<size_t>(crop_x);
 
     webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
         webrtc::I420Buffer::Create(width_, height_);
     const int converted = libyuv::NV12ToI420(
-        y, stride, uv, stride, i420->MutableDataY(), i420->StrideY(),
+        y, pitch, uv, pitch, i420->MutableDataY(), i420->StrideY(),
         i420->MutableDataU(), i420->StrideU(), i420->MutableDataV(),
         i420->StrideV(), width_, height_);
-    buffer->Unlock();
+    unlock();
 
     if (converted != 0) return;
 
@@ -317,8 +455,17 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
   ComPtr<ID3D11Device> device_;
 
   webrtc::DecodedImageCallback* callback_ = nullptr;
+  // Видимая часть кадра.
   int width_ = 0;
   int height_ = 0;
+  // Поверхность целиком, с выравниванием по макроблоку.
+  int aligned_width_ = 0;
+  int aligned_height_ = 0;
+  // Начало видимой части внутри поверхности.
+  int crop_x_ = 0;
+  int crop_y_ = 0;
+  // Запасной шаг строки, когда буфер не отдаёт свой.
+  LONG default_stride_ = 0;
 };
 
 #endif  // WEBRTC_WIN
