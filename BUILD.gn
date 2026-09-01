@@ -216,6 +216,8 @@ rtc_shared_library("libwebrtc") {
     sources += [
       "src/win/mf_video_decoder.cc",
       "src/win/mf_video_decoder.h",
+      "src/win/mf_video_encoder.cc",
+      "src/win/mf_video_encoder.h",
       "src/win/nvenc_video_encoder.cc",
       "src/win/nvenc_video_encoder.h",
       "src/win/squeak_video_decoder_factory.cc",

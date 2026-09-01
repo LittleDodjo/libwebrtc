@@ -18,6 +18,7 @@
 #include "api/video_codecs/sdp_video_format.h"
 #include "api/video_codecs/video_encoder.h"
 #include "rtc_base/logging.h"
+#include "src/win/mf_video_encoder.h"
 #include "src/win/nvenc_video_encoder.h"
 
 namespace squeak {
@@ -35,13 +36,27 @@ class SqueakVideoEncoderFactory : public webrtc::VideoEncoderFactory {
   std::unique_ptr<webrtc::VideoEncoder> Create(
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
-    if (absl::EqualsIgnoreCase(format.name, "H264") && NvencH264Supported()) {
-      std::unique_ptr<webrtc::VideoEncoder> encoder =
-          CreateNvencH264Encoder(env, format);
-      if (encoder != nullptr) {
-        RTC_LOG(LS_INFO) << "Squeak: H.264 идёт через NVENC";
-        return encoder;
+    if (absl::EqualsIgnoreCase(format.name, "H264")) {
+      // NVENC первым: у него тоньше настройка задержки и GOP. Media Foundation
+      // следом — одна реализация закрывает AMD, Intel и NVIDIA без карты
+      // конкретного вендора. Софт остаётся последним рубежом.
+      if (NvencH264Supported()) {
+        std::unique_ptr<webrtc::VideoEncoder> encoder =
+            CreateNvencH264Encoder(env, format);
+        if (encoder != nullptr) {
+          RTC_LOG(LS_INFO) << "Squeak: H.264 идёт через NVENC";
+          return encoder;
+        }
       }
+      if (MediaFoundationH264EncoderSupported()) {
+        std::unique_ptr<webrtc::VideoEncoder> encoder =
+            CreateMediaFoundationH264Encoder(env, format);
+        if (encoder != nullptr) {
+          RTC_LOG(LS_INFO) << "Squeak: H.264 идёт через Media Foundation";
+          return encoder;
+        }
+      }
+      RTC_LOG(LS_INFO) << "Squeak: H.264 идёт софтом";
     }
     return builtin_->Create(env, format);
   }
