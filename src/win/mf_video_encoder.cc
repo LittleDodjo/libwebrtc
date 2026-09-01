@@ -31,12 +31,17 @@
 
 #if defined(WEBRTC_WIN)
 
+// Порядок значим, по алфавиту сортировать нельзя: windows.h идёт первым, а сам
+// интерфейс ICodecAPI объявлен в MIDL-заголовке icodecapi.h — в codecapi.h
+// лежат только CODECAPI_*-гуиды, поэтому одного его мало.
+#include <windows.h>
+
 #include <codecapi.h>
+#include <icodecapi.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
 #include <mftransform.h>
-#include <windows.h>
 #include <wrl/client.h>
 
 #endif  // WEBRTC_WIN
