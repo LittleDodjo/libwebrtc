@@ -33,9 +33,13 @@ on:
       build_apple:
         description: 'Build Apple xcframework (mac/ios/tvos/visionos)'
         type: boolean
-        default: true
+        default: false
       build_android:
         description: 'Build Android AAR (multi-arch)'
+        type: boolean
+        default: false
+      x64_only:
+        description: 'Only x64 (skip arm64) — проверочные прогоны короче на ~20 минут'
         type: boolean
         default: true
 
@@ -50,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
+        arch: ${{ (github.event_name == 'workflow_dispatch' && inputs.x64_only) && fromJSON('["x64"]') || fromJSON('["x64","arm64"]') }}
         profile:
           - ${{ github.event.inputs.configuration || 'release' }}
     name: Build libwebrtc.so for Linux (${{ matrix.arch }}-${{ matrix.profile }})
@@ -113,7 +117,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64]
+        arch: ${{ (github.event_name == 'workflow_dispatch' && inputs.x64_only) && fromJSON('["x64"]') || fromJSON('["x64","arm64"]') }}
         profile:
           - ${{ github.event.inputs.configuration || 'release' }}
     name: Build libwebrtc.dll for Windows (${{ matrix.arch }}-${{ matrix.profile }})
