@@ -216,10 +216,19 @@ scoped_refptr<RTCAudioSource> RTCPeerConnectionFactoryImpl::CreateAudioSource(
     const string audio_source_label, RTCAudioSource::SourceType source_type,
     RTCAudioOptions options) {
   auto rtc_options = webrtc::AudioOptions();
-  rtc_options.echo_cancellation = options.echo_cancellation;
-  rtc_options.auto_gain_control = options.auto_gain_control;
-  rtc_options.noise_suppression = options.noise_suppression;
-  rtc_options.highpass_filter = options.highpass_filter;
+  // APM в движке один на всех, и опции источника уезжают в него глобально при
+  // добавлении трека в PeerConnection. Для custom-источника это чистый
+  // побочный эффект: его кадры приходят через CaptureFrame мимо audio
+  // transport, то есть APM их всё равно не трогает, — зато выключенные у него
+  // эхоподавитель и шумодав выключались заодно и микрофону, и обратно уже не
+  // включались. Оставляем поля незаполненными: ApplyOptions меняет только то,
+  // что задано явно.
+  if (source_type != RTCAudioSource::SourceType::kCustom) {
+    rtc_options.echo_cancellation = options.echo_cancellation;
+    rtc_options.auto_gain_control = options.auto_gain_control;
+    rtc_options.noise_suppression = options.noise_suppression;
+    rtc_options.highpass_filter = options.highpass_filter;
+  }
   webrtc::scoped_refptr<libwebrtc::LocalAudioSource> rtc_source_track =
       CreateAudioSourceWithOptions(
           &rtc_options, source_type == RTCAudioSource::SourceType::kCustom);
