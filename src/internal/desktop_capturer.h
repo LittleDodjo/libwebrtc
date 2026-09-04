@@ -43,6 +43,14 @@ class ScreenCapturerTrackSource : public webrtc::VideoTrackSource {
       : VideoTrackSource(/*remote=*/false), capturer_(std::move(capturer)) {}
   virtual ~ScreenCapturerTrackSource() { capturer_->Stop(); }
 
+  // Базовый VideoTrackSource отвечает false, и webrtc всё это время кодировал
+  // рабочий стол как видео с камеры. Отсюда тянулось многое: работал
+  // quality scaler, который сам понижает разрешение по QP (для текста это
+  // худшее, что можно сделать), рейт-контроль был рассчитан на движущуюся
+  // сцену с шумом, а не на статичную картинку с резкими границами, и не
+  // применялся screencast_min_bitrate.
+  bool is_screencast() const override { return true; }
+
  private:
   webrtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
     return static_cast<RTCDesktopCapturerImpl*>(capturer_.get());
