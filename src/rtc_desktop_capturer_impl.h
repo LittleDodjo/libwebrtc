@@ -55,6 +55,8 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   CaptureState Start(uint32_t fps, uint32_t x, uint32_t y, uint32_t w,
                      uint32_t h) override;
 
+  void SetOutputSize(int width, int height) override;
+
   void Stop() override;
 
   bool IsRunning() override;

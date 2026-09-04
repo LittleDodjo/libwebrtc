@@ -9,9 +9,11 @@
 
 #if defined(WEBRTC_WIN)
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 
+#include "common_video/include/video_frame_buffer_pool.h"
 #include "rtc_base/logging.h"
 
 #include <windows.h>
@@ -31,18 +33,40 @@ int MakeEven(UINT value) {
   return static_cast<int>(value & ~1u);
 }
 
+// Кадров в обороте: один отдан энкодеру, один готовится, плюс запас на то,
+// что энкодер задержит буфер дольше кадра. Пул возвращает nullptr, когда все
+// заняты — это лучше, чем аллоцировать двенадцать мегабайт на каждый кадр.
+constexpr size_t kPoolSize = 8;
+
 }  // namespace
 
 class GpuScreenCapturer::Impl {
  public:
+  Impl() : pool_(/*zero_initialize=*/false, kPoolSize) {}
+
   bool Init(int64_t screen_index) {
     screen_index_ = screen_index < 0 ? 0 : screen_index;
     if (!CreateDevice()) return false;
     return OpenDuplication();
   }
 
+  void SetOutputSize(int width, int height) {
+    target_width_ = width > 0 ? width : 0;
+    target_height_ = height > 0 ? height : 0;
+  }
+
   webrtc::scoped_refptr<webrtc::NV12Buffer> Capture() {
     if (duplication_ == nullptr && !OpenDuplication()) return last_;
+
+    // Сначала забираем кадр, поставленный в очередь на прошлом тике: за
+    // прошедший интервал видеокарта успела его домолотить, и Map не встанет в
+    // ожидание. Раньше блит и чтение шли подряд в одном тике, и каждый кадр
+    // упирался в полную синхронизацию с GPU.
+    Fetch();
+
+    // Пока прошлый кадр не забран, новый не ставим: очередь длиной в один
+    // кадр и есть вся суть двойной буферизации.
+    if (pending_ >= 0) return last_;
 
     DXGI_OUTDUPL_FRAME_INFO info = {};
     ComPtr<IDXGIResource> resource;
@@ -57,7 +81,7 @@ class GpuScreenCapturer::Impl {
     }
 
     ComPtr<ID3D11Texture2D> texture;
-    if (SUCCEEDED(resource.As(&texture))) Convert(texture);
+    if (SUCCEEDED(resource.As(&texture))) Enqueue(texture);
     duplication_->ReleaseFrame();
     return last_;
   }
@@ -114,23 +138,53 @@ class GpuScreenCapturer::Impl {
     return true;
   }
 
-  // Пересобираем конвейер, когда сменилось разрешение экрана.
+  // Габарит выхода: вписываем кадр в запрошенный прямоугольник, сохраняя
+  // пропорции. Вверх не масштабируем — рисовать несуществующие пиксели незачем.
+  void OutputSizeFor(UINT width, UINT height, int* out_width, int* out_height) const {
+    if (target_width_ <= 0 || target_height_ <= 0) {
+      *out_width = MakeEven(width);
+      *out_height = MakeEven(height);
+      return;
+    }
+    const double scale =
+        std::min(static_cast<double>(target_width_) / static_cast<double>(width),
+                 static_cast<double>(target_height_) / static_cast<double>(height));
+    if (scale >= 1.0) {
+      *out_width = MakeEven(width);
+      *out_height = MakeEven(height);
+      return;
+    }
+    *out_width = MakeEven(static_cast<UINT>(width * scale + 0.5));
+    *out_height = MakeEven(static_cast<UINT>(height * scale + 0.5));
+  }
+
+  // Пересобираем конвейер, когда сменилось разрешение экрана или запрошенный
+  // размер выхода.
   bool EnsureProcessor(UINT width, UINT height) {
-    const int even_width = MakeEven(width);
-    const int even_height = MakeEven(height);
-    if (even_width <= 0 || even_height <= 0) return false;
-    if (processor_ != nullptr && even_width == width_ && even_height == height_) {
+    int out_width = 0;
+    int out_height = 0;
+    OutputSizeFor(width, height, &out_width, &out_height);
+    if (out_width <= 0 || out_height <= 0) return false;
+    if (processor_ != nullptr && out_width == width_ && out_height == height_ &&
+        width == input_width_ && height == input_height_) {
       return true;
     }
 
-    width_ = even_width;
-    height_ = even_height;
+    width_ = out_width;
+    height_ = out_height;
+    input_width_ = width;
+    input_height_ = height;
     processor_.Reset();
     enumerator_.Reset();
     output_view_.Reset();
+    input_view_.Reset();
     source_.Reset();
     nv12_.Reset();
-    staging_.Reset();
+    staging_[0].Reset();
+    staging_[1].Reset();
+    pending_ = -1;
+    write_ = 0;
+    stalls_ = 0;
     last_ = nullptr;
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC content = {};
@@ -174,15 +228,35 @@ class GpuScreenCapturer::Impl {
     desc.BindFlags = 0;
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (FAILED(device_->CreateTexture2D(&desc, nullptr, &staging_))) return false;
+    for (auto& staging : staging_) {
+      if (FAILED(device_->CreateTexture2D(&desc, nullptr, &staging))) return false;
+    }
 
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC view = {};
     view.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    return SUCCEEDED(video_device_->CreateVideoProcessorOutputView(
-        nv12_.Get(), enumerator_.Get(), &view, &output_view_));
+    if (FAILED(video_device_->CreateVideoProcessorOutputView(
+            nv12_.Get(), enumerator_.Get(), &view, &output_view_))) {
+      return false;
+    }
+
+    // Представление входа переживает кадры: текстура-источник у нас своя и не
+    // меняется. Раньше оно создавалось заново на каждый кадр — драйверная
+    // аллокация шестьдесят раз в секунду на ровном месте.
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input = {};
+    input.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    if (FAILED(video_device_->CreateVideoProcessorInputView(
+            source_.Get(), enumerator_.Get(), &input, &input_view_))) {
+      return false;
+    }
+
+    RTC_LOG(LS_INFO) << "GPU-capture: " << width << "x" << height << " -> "
+                     << width_ << "x" << height_;
+    return true;
   }
 
-  void Convert(const ComPtr<ID3D11Texture2D>& texture) {
+  // Блит и постановка кадра в очередь на чтение. Процессор здесь не ждёт
+  // видеокарту: забираем результат на следующем тике.
+  void Enqueue(const ComPtr<ID3D11Texture2D>& texture) {
     D3D11_TEXTURE2D_DESC desc = {};
     texture->GetDesc(&desc);
     if (!EnsureProcessor(desc.Width, desc.Height)) return;
@@ -192,17 +266,9 @@ class GpuScreenCapturer::Impl {
     // теми bind-флагами. Копия внутри видеопамяти стоит копейки.
     context_->CopyResource(source_.Get(), texture.Get());
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC view = {};
-    view.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    ComPtr<ID3D11VideoProcessorInputView> input_view;
-    if (FAILED(video_device_->CreateVideoProcessorInputView(
-            source_.Get(), enumerator_.Get(), &view, &input_view))) {
-      return;
-    }
-
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
     stream.Enable = TRUE;
-    stream.pInputSurface = input_view.Get();
+    stream.pInputSurface = input_view_.Get();
     // Один блит делает и переход BGRA -> NV12, и масштаб, если разрешение
     // выхода отличается от входа.
     if (FAILED(video_context_->VideoProcessorBlt(processor_.Get(),
@@ -211,33 +277,59 @@ class GpuScreenCapturer::Impl {
       return;
     }
 
-    context_->CopyResource(staging_.Get(), nv12_.Get());
+    context_->CopyResource(staging_[write_].Get(), nv12_.Get());
+    pending_ = write_;
+    write_ ^= 1;
+  }
+
+  // Забирает кадр, если видеокарта его уже дописала. DO_NOT_WAIT — чтобы поток
+  // захвата не вставал в ожидание: не готов, значит придём на следующем тике.
+  void Fetch() {
+    if (pending_ < 0) return;
+
+    // Страховка от вечного ожидания: если драйвер раз за разом отвечает «ещё
+    // рисую», на третий раз ждём по-честному. Лучше один залипший кадр, чем
+    // замерший навсегда захват.
+    const UINT flags = stalls_ < 3 ? D3D11_MAP_FLAG_DO_NOT_WAIT : 0;
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+    const HRESULT hr =
+        context_->Map(staging_[pending_].Get(), 0, D3D11_MAP_READ, flags, &mapped);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+      ++stalls_;
+      return;
+    }
+    stalls_ = 0;
+    if (FAILED(hr)) {
+      pending_ = -1;
       return;
     }
 
-    auto buffer = webrtc::NV12Buffer::Create(width_, height_);
-    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
-    uint8_t* dst_y = buffer->MutableDataY();
-    for (int row = 0; row < height_; ++row) {
-      std::memcpy(dst_y + row * buffer->StrideY(), src + row * mapped.RowPitch,
-                  width_);
+    // Пул отдаёт буфер, который никто больше не держит. Если все восемь ещё у
+    // энкодера, кадр пропускаем: это лучше, чем аллокация на кадр.
+    auto buffer = pool_.CreateNV12Buffer(width_, height_);
+    if (buffer != nullptr) {
+      const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+      uint8_t* dst_y = buffer->MutableDataY();
+      for (int row = 0; row < height_; ++row) {
+        std::memcpy(dst_y + row * buffer->StrideY(), src + row * mapped.RowPitch,
+                    width_);
+      }
+      // Плоскость UV лежит сразу за яркостной, её высота вдвое меньше, а ширина
+      // в байтах та же: пара U и V на два пикселя по горизонтали. Отступ
+      // считается по высоте staging-текстуры (height_), а НЕ источника: они
+      // расходятся, когда сторона экрана нечётная.
+      const uint8_t* src_uv = src + mapped.RowPitch * height_;
+      uint8_t* dst_uv = buffer->MutableDataUV();
+      for (int row = 0; row < height_ / 2; ++row) {
+        std::memcpy(dst_uv + row * buffer->StrideUV(),
+                    src_uv + row * mapped.RowPitch, width_);
+      }
+      last_ = buffer;
     }
-    // Плоскость UV лежит сразу за яркостной, её высота вдвое меньше, а ширина
-    // в байтах та же: пара U и V на два пикселя по горизонтали. Отступ
-    // считается по высоте staging-текстуры (height_), а НЕ источника: они
-    // расходятся, когда сторона экрана нечётная.
-    const uint8_t* src_uv = src + mapped.RowPitch * height_;
-    uint8_t* dst_uv = buffer->MutableDataUV();
-    for (int row = 0; row < height_ / 2; ++row) {
-      std::memcpy(dst_uv + row * buffer->StrideUV(),
-                  src_uv + row * mapped.RowPitch, width_);
-    }
-    context_->Unmap(staging_.Get(), 0);
 
-    last_ = buffer;
+    context_->Unmap(staging_[pending_].Get(), 0);
+    pending_ = -1;
   }
 
   ComPtr<IDXGIAdapter1> adapter_;
@@ -250,16 +342,25 @@ class GpuScreenCapturer::Impl {
   ComPtr<ID3D11VideoProcessorEnumerator> enumerator_;
   ComPtr<ID3D11VideoProcessor> processor_;
   ComPtr<ID3D11VideoProcessorOutputView> output_view_;
+  ComPtr<ID3D11VideoProcessorInputView> input_view_;
   ComPtr<ID3D11Texture2D> source_;
   ComPtr<ID3D11Texture2D> nv12_;
-  ComPtr<ID3D11Texture2D> staging_;
+  ComPtr<ID3D11Texture2D> staging_[2];
 
+  webrtc::VideoFrameBufferPool pool_;
   webrtc::scoped_refptr<webrtc::NV12Buffer> last_;
 
   int64_t screen_index_ = 0;
   UINT seen_outputs_ = 0;
+  UINT input_width_ = 0;
+  UINT input_height_ = 0;
+  int target_width_ = 0;
+  int target_height_ = 0;
   int width_ = 0;
   int height_ = 0;
+  int write_ = 0;
+  int pending_ = -1;
+  int stalls_ = 0;
 };
 
 GpuScreenCapturer::GpuScreenCapturer(std::unique_ptr<Impl> impl)
@@ -277,6 +378,10 @@ std::unique_ptr<GpuScreenCapturer> GpuScreenCapturer::Create(
   RTC_LOG(LS_INFO) << "GPU-capture: Desktop Duplication + NV12 на выходе";
   return std::unique_ptr<GpuScreenCapturer>(
       new GpuScreenCapturer(std::move(impl)));
+}
+
+void GpuScreenCapturer::SetOutputSize(int width, int height) {
+  impl_->SetOutputSize(width, height);
 }
 
 webrtc::scoped_refptr<webrtc::NV12Buffer> GpuScreenCapturer::Capture() {

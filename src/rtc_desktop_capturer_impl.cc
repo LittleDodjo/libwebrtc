@@ -141,6 +141,12 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
   return capture_state_;
 }
 
+void RTCDesktopCapturerImpl::SetOutputSize(int width, int height) {
+#ifdef WEBRTC_WIN
+  if (gpu_capturer_ != nullptr) gpu_capturer_->SetOutputSize(width, height);
+#endif
+}
+
 void RTCDesktopCapturerImpl::Stop() {
   if (observer_) {
     if (!signaling_thread_->IsCurrent()) {
