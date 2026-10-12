@@ -19,6 +19,7 @@
 
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
+#include "common_video/include/video_frame_buffer_pool.h"
 #include "include/rtc_desktop_capturer.h"
 #include "include/rtc_types.h"
 #include "modules/desktop_capture/desktop_and_cursor_composer.h"
@@ -79,6 +80,12 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   std::unique_ptr<webrtc::DesktopCapturer> capturer_;
   std::unique_ptr<webrtc::Thread> thread_;
   webrtc::scoped_refptr<webrtc::I420Buffer> i420_buffer_;
+  // Окна и экран без GPU-захвата кодировались в родном размере: заданный
+  // габарит доходил только до GpuScreenCapturer. Ужатые кадры — из пула,
+  // кодировщик ещё может держать предыдущий.
+  int target_width_ = 0;
+  int target_height_ = 0;
+  webrtc::VideoFrameBufferPool scaled_pool_;
   CaptureState capture_state_ = CS_STOPPED;
   DesktopType type_;
   webrtc::DesktopCapturer::SourceId source_id_;

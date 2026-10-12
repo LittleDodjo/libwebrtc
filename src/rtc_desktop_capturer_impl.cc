@@ -16,6 +16,8 @@
 
 #include "rtc_desktop_capturer_impl.h"
 
+#include <algorithm>
+
 #include "api/sequence_checker.h"
 #include "rtc_base/checks.h"
 #include "third_party/libyuv/include/libyuv.h"
@@ -142,6 +144,8 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
 }
 
 void RTCDesktopCapturerImpl::SetOutputSize(int width, int height) {
+  target_width_ = width > 0 ? width : 0;
+  target_height_ = height > 0 ? height : 0;
 #ifdef WEBRTC_WIN
   if (gpu_capturer_ != nullptr) gpu_capturer_->SetOutputSize(width, height);
 #endif
@@ -233,7 +237,24 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
 #endif
                           width, height, libyuv::kRotate0, libyuv::FOURCC_ARGB);
 
-    OnFrame(webrtc::VideoFrame(i420_buffer_, 0, webrtc::TimeMillis(),
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> out = i420_buffer_;
+    if (target_width_ > 0 && target_height_ > 0 &&
+        (width > target_width_ || height > target_height_)) {
+      // Вписываем с сохранением пропорций; чётные стороны — требование I420.
+      const double scale =
+          std::min(static_cast<double>(target_width_) / width,
+                   static_cast<double>(target_height_) / height);
+      const int out_width = std::max(2, static_cast<int>(width * scale) & ~1);
+      const int out_height =
+          std::max(2, static_cast<int>(height * scale) & ~1);
+      webrtc::scoped_refptr<webrtc::I420Buffer> scaled =
+          scaled_pool_.CreateI420Buffer(out_width, out_height);
+      if (!scaled) return;
+      scaled->ScaleFrom(*i420_buffer_);
+      out = scaled;
+    }
+
+    OnFrame(webrtc::VideoFrame(out, 0, webrtc::TimeMillis(),
                                webrtc::kVideoRotation_0));
   }
 #ifdef WEBRTC_WIN
