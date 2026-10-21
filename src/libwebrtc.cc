@@ -4,6 +4,10 @@
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
 #include "rtc_peerconnection_factory_impl.h"
+#if defined(SQUEAK_USE_NVENC)
+#include "src/win/gpu_context.h"
+#include "src/win/squeak_video_encoder_factory.h"
+#endif
 
 namespace libwebrtc {
 
@@ -35,6 +39,23 @@ LibWebRTC::CreateRTCPeerConnectionFactory() {
       scoped_refptr<RTCPeerConnectionFactory>(
           new RefCountedObject<RTCPeerConnectionFactoryImpl>());
   return rtc_peerconnection_factory;
+}
+
+void LibWebRTC::SetHardwareEncoderOrder(const string& csv) {
+#if defined(SQUEAK_USE_NVENC)
+  squeak::SetHardwareEncoderOrder(to_std_string(csv));
+#else
+  (void)csv;
+#endif
+}
+
+void* LibWebRTC::GetD3D11Device() {
+#if defined(SQUEAK_USE_NVENC)
+  auto gpu = squeak::GpuContext::Shared();
+  return gpu != nullptr ? gpu->device() : nullptr;
+#else
+  return nullptr;
+#endif
 }
 
 }  // namespace libwebrtc

@@ -17,11 +17,15 @@
 #include "rtc_desktop_capturer_impl.h"
 
 #include <algorithm>
+#include <utility>
 
 #include "api/sequence_checker.h"
 #include "rtc_base/checks.h"
+#include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv.h"
 #ifdef WEBRTC_WIN
+#include <timeapi.h>
+
 #include "modules/desktop_capture/win/window_capture_utils.h"
 #endif
 
@@ -52,7 +56,7 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
 #endif
 #ifdef WEBRTC_WIN
   if (type == kScreen) {
-    gpu_capturer_ = squeak::GpuScreenCapturer::Create(source_id);
+    gpu_capturer_ = squeak::GpuScreenCapturer::Create(source_id, showCursor);
   }
   if (gpu_capturer_ != nullptr) return;
 #endif
@@ -73,6 +77,14 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
 }
 
 RTCDesktopCapturerImpl::~RTCDesktopCapturerImpl() {
+#ifdef WEBRTC_WIN
+  // Сначала останавливаем поток захвата: его callback зовёт OnFrame этого объекта.
+  if (gpu_capturer_ != nullptr) gpu_capturer_->Stop();
+  if (timer_period_raised_) {
+    ::timeEndPeriod(1);
+    timer_period_raised_ = false;
+  }
+#endif
   thread_->Stop();
   capturer_.reset();
 #ifdef WEBRTC_WIN
@@ -112,8 +124,24 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
 
 #ifdef WEBRTC_WIN
   if (gpu_capturer_ != nullptr) {
+    // Ритм задаёт сам захватчик в своём потоке; сюда приходят готовые кадры
+    // в видеопамяти, никакой работы с пикселями на этом пути нет.
+    const bool started = gpu_capturer_->Start(
+        fps >= 60 ? 60 : fps,
+        [this](webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer,
+               int64_t timestamp_us) {
+          if (capture_state_ != CS_RUNNING) return;
+          OnFrame(webrtc::VideoFrame::Builder()
+                      .set_video_frame_buffer(std::move(buffer))
+                      .set_timestamp_us(timestamp_us)
+                      .set_rotation(webrtc::kVideoRotation_0)
+                      .build());
+        });
+    if (!started) {
+      capture_state_ = CS_FAILED;
+      return capture_state_;
+    }
     capture_state_ = CS_RUNNING;
-    thread_->PostTask([this] { CaptureFrame(); });
     if (observer_) {
       signaling_thread_->BlockingCall([&, this]() { observer_->OnStart(this); });
     }
@@ -136,6 +164,16 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
 
   thread_->BlockingCall([this] { capturer_->Start(this); });
   capture_state_ = CS_RUNNING;
+#ifdef WEBRTC_WIN
+  // Запасной путь живёт на отложенных задачах потока webrtc, а их ожидание
+  // квантуется системным таймером: без кванта в 1 мс дедлайн 16 мс превращается
+  // в 31.
+  if (!timer_period_raised_) {
+    ::timeBeginPeriod(1);
+    timer_period_raised_ = true;
+  }
+#endif
+  next_capture_us_ = 0;
   thread_->PostTask([this] { CaptureFrame(); });
   if (observer_) {
     signaling_thread_->BlockingCall([&, this]() { observer_->OnStart(this); });
@@ -160,6 +198,13 @@ void RTCDesktopCapturerImpl::Stop() {
     }
   }
   capture_state_ = CS_STOPPED;
+#ifdef WEBRTC_WIN
+  if (gpu_capturer_ != nullptr) gpu_capturer_->Stop();
+  if (timer_period_raised_) {
+    ::timeEndPeriod(1);
+    timer_period_raised_ = false;
+  }
+#endif
 }
 
 bool RTCDesktopCapturerImpl::IsRunning() {
@@ -265,25 +310,20 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
 
 void RTCDesktopCapturerImpl::CaptureFrame() {
   RTC_DCHECK_RUN_ON(thread_.get());
-  if (capture_state_ == CS_RUNNING) {
-#ifdef WEBRTC_WIN
-    if (gpu_capturer_ != nullptr) {
-      auto buffer = gpu_capturer_->Capture();
-      if (buffer != nullptr) {
-        OnFrame(webrtc::VideoFrame(buffer, 0, webrtc::TimeMillis(),
-                                   webrtc::kVideoRotation_0));
-      }
-      thread_->PostDelayedHighPrecisionTask(
-          [this]() { CaptureFrame(); },
-          webrtc::TimeDelta::Millis(capture_delay_));
-      return;
-    }
-#endif
-    capturer_->CaptureFrame();
-    thread_->PostDelayedHighPrecisionTask(
-        [this]() { CaptureFrame(); },
-        webrtc::TimeDelta::Millis(capture_delay_));
-  }
+  if (capture_state_ != CS_RUNNING) return;
+
+  // Запасной путь webrtc (окна, не-Windows). Дедлайн держим сами: «поставить
+  // следующий тик через период после текущего» на квантованном таймере Windows
+  // давало период в два кванта — 30 к/с при запрошенных 60.
+  const int64_t now_us = webrtc::TimeMicros();
+  if (next_capture_us_ == 0) next_capture_us_ = now_us;
+  capturer_->CaptureFrame();
+  next_capture_us_ += static_cast<int64_t>(capture_delay_) * 1000;
+  if (next_capture_us_ < now_us) next_capture_us_ = now_us;
+  const int64_t wait_us = next_capture_us_ - webrtc::TimeMicros();
+  thread_->PostDelayedHighPrecisionTask(
+      [this]() { CaptureFrame(); },
+      webrtc::TimeDelta::Micros(wait_us > 0 ? wait_us : 0));
 }
 
 }  // namespace libwebrtc

@@ -47,6 +47,28 @@ class RTCVideoFrame : public RefCountInterface {
   virtual int ConvertToARGB(Type type, uint8_t* dst_argb, int dst_stride_argb,
                             int dest_width, int dest_height) = 0;
 
+  /**
+   * Windows: кадр живёт в видеопамяти. ID3D11Texture2D* (NV12, без AddRef) на
+   * устройстве LibWebRTC::GetD3D11Device(); nullptr для кадра в системной
+   * памяти и вне Windows. Текстура живёт, пока жив кадр.
+   */
+  virtual void* d3d11_texture() const { return nullptr; }
+
+  /**
+   * Рисует кадр в текстуру D3D11 (BGRA/RGBA render target на устройстве
+   * LibWebRTC::GetD3D11Device(), например back buffer swap chain или общая
+   * текстура для Flutter). Перевод цвета и масштаб делает видеокарта; кадр
+   * вписывается в прямоугольник (x, y, width, height) с сохранением пропорций,
+   * поля внутри него чёрные; width/height <= 0 — вся текстура. Поворот
+   * кадра не применяется. Кадр из системной памяти предварительно
+   * заливается. false — не смогли (чужое устройство, нет D3D11): вызывающий
+   * рисует через ConvertToARGB.
+   */
+  virtual bool RenderToD3D11Texture(void* texture, int x, int y, int width,
+                                    int height) {
+    return false;
+  }
+
  protected:
   virtual ~RTCVideoFrame() {}
 };

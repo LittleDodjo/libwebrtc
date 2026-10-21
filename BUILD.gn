@@ -209,11 +209,20 @@ rtc_shared_library("libwebrtc") {
     ]
   }
 
-  # squeak: аппаратный H.264 через NVENC. Заголовок nvEncodeAPI.h вендорится
-  # (MIT, из FFmpeg/nv-codec-headers), сама nvEncodeAPI64.dll приезжает с
-  # драйвером NVIDIA и грузится в рантайме.
+  # squeak: аппаратное видео на Windows. Общее D3D11-устройство (gpu_context),
+  # кадр как текстура (d3d11_frame_buffer), захват Desktop Duplication,
+  # энкодеры NVENC / AMF / Media Foundation и декодер Media Foundation.
+  # Заголовки вендорятся: nvEncodeAPI.h (MIT, FFmpeg/nv-codec-headers) и AMF
+  # (MIT, GPUOpen-LibrariesAndSDKs/AMF). Рантаймы nvEncodeAPI64.dll и amfrt64.dll
+  # приезжают с драйверами и грузятся в рантайме.
   if (is_win) {
     sources += [
+      "src/win/amf_video_encoder.cc",
+      "src/win/amf_video_encoder.h",
+      "src/win/d3d11_frame_buffer.cc",
+      "src/win/d3d11_frame_buffer.h",
+      "src/win/gpu_context.cc",
+      "src/win/gpu_context.h",
       "src/win/gpu_screen_capturer.cc",
       "src/win/gpu_screen_capturer.h",
       "src/win/mf_video_decoder.cc",
@@ -229,12 +238,14 @@ rtc_shared_library("libwebrtc") {
     ]
     defines += [ "SQUEAK_USE_NVENC" ]
     libs += [
+      "avrt.lib",
       "d3d11.lib",
       "dxgi.lib",
       "mf.lib",
       "mfplat.lib",
       "mfuuid.lib",
       "strmiids.lib",
+      "winmm.lib",
     ]
   }
 

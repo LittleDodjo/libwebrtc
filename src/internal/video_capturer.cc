@@ -36,11 +36,12 @@ void VideoCapturer::OnFrame(const VideoFrame& frame) {
   }
 
   if (out_height != frame.height() || out_width != frame.width()) {
-    // Video adapter has requested a down-scale. Allocate a new buffer and
-    // return scaled version.
-    webrtc::scoped_refptr<I420Buffer> scaled_buffer =
-        I420Buffer::Create(out_width, out_height);
-    scaled_buffer->ScaleFrom(*frame.video_frame_buffer()->ToI420());
+    // Адаптер попросил разрешение ниже. Scale виртуальный: кадр в видеопамяти
+    // масштабируется видеокартой, NV12 — без круга через I420. Прежний
+    // ToI420 + ScaleFrom стаскивал кадр в память процессора при любой адаптации.
+    webrtc::scoped_refptr<VideoFrameBuffer> scaled_buffer =
+        frame.video_frame_buffer()->Scale(out_width, out_height);
+    if (!scaled_buffer) return;
     broadcaster_.OnFrame(VideoFrame::Builder()
                              .set_video_frame_buffer(scaled_buffer)
                              .set_rotation(kVideoRotation_0)

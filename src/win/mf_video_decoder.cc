@@ -14,6 +14,7 @@
 #include "api/video/i420_buffer.h"
 #include "api/video/render_resolution.h"
 #include "api/video/video_frame.h"
+#include "common_video/include/video_frame_buffer_pool.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/time_utils.h"
@@ -29,6 +30,9 @@
 #include <wmcodecdsp.h>
 #include <windows.h>
 #include <wrl/client.h>
+
+#include "src/win/d3d11_frame_buffer.h"
+#include "src/win/gpu_context.h"
 
 #endif  // WEBRTC_WIN
 
@@ -100,6 +104,9 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
       Release();
       return false;
     }
+    // Пока зрителей один-два, достаточно; больше — декодер начнёт ждать
+    // освобождения своих поверхностей, и это увидим в логе.
+    native_failures_ = 0;
 
     const webrtc::RenderResolution resolution = settings.max_render_resolution();
     width_ = resolution.Valid() ? resolution.Width() : 1920;
@@ -149,6 +156,7 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
     }
     device_manager_.Reset();
     device_.Reset();
+    gpu_ = nullptr;
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
@@ -161,6 +169,15 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
 
  private:
   bool CreateDevice() {
+    // Декодируем на общем устройстве процесса: тогда распакованный кадр остаётся
+    // текстурой, и рендер берёт его без чтения в память. Устройство уже
+    // защищено ID3D10Multithread — MFT дёргает его из своих потоков.
+    gpu_ = GpuContext::Shared();
+    if (gpu_ != nullptr) {
+      device_ = gpu_->device();
+      return true;
+    }
+
     const UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT |
                        D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     D3D_FEATURE_LEVEL level = {};
@@ -172,7 +189,6 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
       return false;
     }
 
-    // MFT дёргает устройство из своих потоков — без этого флага возможны гонки.
     ComPtr<ID3D10Multithread> multithread;
     if (SUCCEEDED(device_.As(&multithread))) {
       multithread->SetMultithreadProtected(TRUE);
@@ -352,12 +368,73 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
 
   enum class LockKind { kNone, k2DSize, k2D, kFlat };
 
+  // Кадр из поверхности декодера копируется в текстуру пула внутри видеопамяти,
+  // сразу без полей выравнивания. Свою поверхность MFT получает обратно тут же:
+  // держать её дольше нельзя, иначе декодер встанет без свободных буферов.
+  // Возвращает false, если буфер не в видеопамяти (тогда нативного пути нет
+  // вовсе). *busy = true — путь есть, но пул текстур сейчас занят: считать это
+  // отказом нельзя, иначе несколько потоков разом выбьют декодер на процессор.
+  bool EmitNativeFrame(IMFMediaBuffer* buffer,
+                       const webrtc::EncodedImage& input, bool* busy) {
+    *busy = false;
+    if (gpu_ == nullptr) return false;
+    ComPtr<IMFDXGIBuffer> dxgi;
+    if (FAILED(buffer->QueryInterface(IID_PPV_ARGS(&dxgi)))) return false;
+    ComPtr<ID3D11Texture2D> texture;
+    UINT subresource = 0;
+    if (FAILED(dxgi->GetResource(IID_PPV_ARGS(&texture))) ||
+        FAILED(dxgi->GetSubresourceIndex(&subresource))) {
+      return false;
+    }
+
+    auto frame = gpu_->CreateNV12Frame(width_ & ~1, height_ & ~1);
+    if (frame == nullptr) {
+      *busy = true;
+      return false;
+    }
+
+    const UINT crop_x = static_cast<UINT>(crop_x_ & ~1);
+    const UINT crop_y = static_cast<UINT>(crop_y_ & ~1);
+    D3D11_BOX box = {crop_x, crop_y, 0,
+                     crop_x + static_cast<UINT>(frame->width()),
+                     crop_y + static_cast<UINT>(frame->height()), 1};
+    {
+      webrtc::MutexLock lock(&gpu_->lock());
+      gpu_->context()->CopySubresourceRegion(frame->texture(), 0, 0, 0, 0,
+                                             texture.Get(), subresource,
+                                             &box);
+    }
+
+    webrtc::VideoFrame out = webrtc::VideoFrame::Builder()
+                                 .set_video_frame_buffer(frame)
+                                 .set_rtp_timestamp(input.RtpTimestamp())
+                                 .set_timestamp_us(webrtc::TimeMicros())
+                                 .build();
+    callback_->Decoded(out);
+    native_failures_ = 0;
+    return true;
+  }
+
   void EmitFrame(IMFSample* sample, const webrtc::EncodedImage& input) {
     if (width_ <= 0 || height_ <= 0) return;
     if (aligned_height_ < height_ || aligned_width_ < width_) return;
 
     ComPtr<IMFMediaBuffer> buffer;
     if (FAILED(sample->GetBufferByIndex(0, &buffer))) return;
+
+    if (native_failures_ < kMaxNativeFailures) {
+      bool busy = false;
+      if (EmitNativeFrame(buffer.Get(), input, &busy)) return;
+      // Занятый пул — временное; кадр пойдёт через память, следующий снова
+      // попробует видеопамять. Буфер не DXGI полсекунды подряд — нативного
+      // пути здесь нет, больше не пробуем.
+      if (!busy) {
+        ++native_failures_;
+        if (native_failures_ == kMaxNativeFailures) {
+          RTC_LOG(LS_WARNING) << "MF: кадры идут через память процессора";
+        }
+      }
+    }
 
     // Шаг строки задаёт САМ буфер, а не ширина кадра: у декодера он выровнен
     // под железо. Поэтому сначала пробуем 2D-интерфейсы, которые его отдают,
@@ -432,8 +509,14 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
                         stride * static_cast<size_t>(crop_y / 2) +
                         static_cast<size_t>(crop_x);
 
+    // Буфер из пула: аллокация на каждый кадр на 4K — это 12 МБ обнуления и дробление
+    // кучи шестьдесят раз в секунду.
     webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
-        webrtc::I420Buffer::Create(width_, height_);
+        pool_.CreateI420Buffer(width_, height_);
+    if (i420 == nullptr) {
+      unlock();
+      return;
+    }
     const int converted = libyuv::NV12ToI420(
         y, pitch, uv, pitch, i420->MutableDataY(), i420->StrideY(),
         i420->MutableDataU(), i420->StrideU(), i420->MutableDataV(),
@@ -453,6 +536,10 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
   ComPtr<IMFTransform> transform_;
   ComPtr<IMFDXGIDeviceManager> device_manager_;
   ComPtr<ID3D11Device> device_;
+  webrtc::scoped_refptr<GpuContext> gpu_;
+  static constexpr int kMaxNativeFailures = 30;
+  int native_failures_ = 0;
+  webrtc::VideoFrameBufferPool pool_;
 
   webrtc::DecodedImageCallback* callback_ = nullptr;
   // Видимая часть кадра.

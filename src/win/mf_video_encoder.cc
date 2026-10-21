@@ -28,6 +28,7 @@
 #include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
 #include "third_party/libyuv/include/libyuv/convert_from.h"
+#include "third_party/libyuv/include/libyuv/planar_functions.h"
 
 #if defined(WEBRTC_WIN)
 
@@ -37,12 +38,16 @@
 #include <windows.h>
 
 #include <codecapi.h>
+#include <d3d11.h>
 #include <icodecapi.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
 #include <mftransform.h>
 #include <wrl/client.h>
+
+#include "src/win/d3d11_frame_buffer.h"
+#include "src/win/gpu_context.h"
 
 #endif  // WEBRTC_WIN
 
@@ -59,6 +64,10 @@ constexpr int kHighQp = 37;
 // Сколько ждём события от асинхронного MFT, прежде чем считать кадр потерянным.
 // Энкодер отвечает за единицы миллисекунд; секунда — это уже «что-то встало».
 constexpr DWORD kEventTimeoutMs = 1000;
+
+// Входных текстур в кольце: асинхронный MFT держит несколько кадров в работе, и
+// перезаписывать текстуру, которую он ещё читает, нельзя.
+constexpr size_t kInputRing = 8;
 
 bool EnsureMediaFoundation() {
   static const bool started = [] {
@@ -176,6 +185,10 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     }
     events_.Reset();
     codec_api_.Reset();
+    device_manager_.Reset();
+    ring_.clear();
+    ring_slot_ = 0;
+    gpu_ = nullptr;
     pending_.clear();
     sequence_header_.clear();
     need_input_ = 0;
@@ -196,21 +209,23 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
       key_frame = (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
     }
 
-    // Смена разрешения на лету: переинициализируем и обязательно с ключевого.
-    if (frame.width() != width_ || frame.height() != height_) {
-      width_ = frame.width();
-      height_ = frame.height();
-      Release();
-      const int result = OpenEncoder();
-      if (result != WEBRTC_VIDEO_CODEC_OK) return result;
-      key_frame = true;
-    }
-
+    // Размер входа отличается от настроенного только из-за scaleResolutionDownBy:
+    // смену разрешения источника webrtc приносит через InitEncode. Масштабируем
+    // кадр (см. WrapFrame*), а не пересоздаём энкодер под размер входа.
     if (reconfigure_needed_) ApplyBitrate();
     if (key_frame) ForceKeyFrame();
 
     ComPtr<IMFSample> sample;
-    if (!WrapFrame(frame, &sample)) return WEBRTC_VIDEO_CODEC_ERROR;
+    if (gpu_ != nullptr) {
+      if (!WrapFrameD3D11(frame, &sample)) {
+        // Текстурный путь не сложился (переполнение, нет видеопамяти) —
+        // пропускаем кадр, следующий пойдёт штатно.
+        PumpEvents(/*block=*/false);
+        return WEBRTC_VIDEO_CODEC_OK;
+      }
+    } else if (!WrapFrame(frame, &sample)) {
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
 
     if (!WaitForInputSlot()) return WEBRTC_VIDEO_CODEC_ERROR;
 
@@ -246,8 +261,13 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     webrtc::VideoEncoder::EncoderInfo info;
     info.implementation_name = implementation_name_;
     info.is_hardware_accelerated = true;
-    info.supports_native_handle = false;
+    // Нативные кадры принимаем всегда: без устройства у MFT сами прочитаем NV12
+    // из текстуры, а с устройством отдадим текстуру как есть.
+    info.supports_native_handle = true;
+    info.preferred_pixel_formats = {webrtc::VideoFrameBuffer::Type::kNV12};
     info.has_trusted_rate_controller = false;
+    info.requested_resolution_alignment = 2;
+    info.apply_alignment_to_all_simulcast_layers = true;
     info.scaling_settings =
         webrtc::VideoEncoder::ScalingSettings(kLowQp, kHighQp);
     return info;
@@ -282,6 +302,8 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
 
+    BindDevice();
+
     // Порядок важен: у энкодера сначала выходной тип, потом входной.
     if (!SetOutputType() || !SetInputType()) {
       Release();
@@ -298,8 +320,110 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
 
     RTC_LOG(LS_INFO) << "MF-enc: " << implementation_name_ << " " << width_
                      << "x" << height_ << "@" << framerate_ << " "
-                     << target_bitrate_bps_ / 1000 << "kbps async=" << is_async_;
+                     << target_bitrate_bps_ / 1000 << "kbps async=" << is_async_
+                     << " d3d11=" << (gpu_ != nullptr);
     return WEBRTC_VIDEO_CODEC_OK;
+  }
+
+  // Вход текстурами: общее устройство процесса уходит MFT через DXGI-менеджер, и
+  // кадр захвата доезжает до энкодера копией внутри видеопамяти. Так работает
+  // Chrome со всеми тремя вендорами. MFT без флага D3D11_AWARE остаётся на
+  // системной памяти.
+  void BindDevice() {
+    gpu_ = nullptr;
+    device_manager_.Reset();
+    ComPtr<IMFAttributes> attributes;
+    UINT32 aware = 0;
+    if (FAILED(transform_->GetAttributes(&attributes)) ||
+        FAILED(attributes->GetUINT32(MF_SA_D3D11_AWARE, &aware)) || aware == 0) {
+      RTC_LOG(LS_INFO) << "MF-enc: MFT не принимает текстуры D3D11";
+      return;
+    }
+    webrtc::scoped_refptr<GpuContext> gpu = GpuContext::Shared();
+    if (gpu == nullptr) return;
+
+    UINT token = 0;
+    ComPtr<IMFDXGIDeviceManager> manager;
+    if (FAILED(::MFCreateDXGIDeviceManager(&token, &manager)) ||
+        FAILED(manager->ResetDevice(gpu->device(), token))) {
+      return;
+    }
+    const HRESULT hr = transform_->ProcessMessage(
+        MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(manager.Get()));
+    if (FAILED(hr)) {
+      RTC_LOG(LS_WARNING) << "MF-enc: SET_D3D_MANAGER hr=" << hr;
+      return;
+    }
+    device_manager_ = manager;
+    gpu_ = gpu;
+  }
+
+  // Своя текстура под вход MFT: с флагом VIDEO_ENCODER, которого у текстур пула
+  // нет, а часть драйверов без него отказывает. Если такую не создать —
+  // обычная, большинству MFT хватает и её.
+  ID3D11Texture2D* RingTexture(size_t slot) {
+    if (ring_.size() != kInputRing) ring_.assign(kInputRing, nullptr);
+    ComPtr<ID3D11Texture2D>& texture = ring_[slot];
+    if (texture != nullptr) {
+      D3D11_TEXTURE2D_DESC desc = {};
+      texture->GetDesc(&desc);
+      if (desc.Width == static_cast<UINT>(width_) &&
+          desc.Height == static_cast<UINT>(height_)) {
+        return texture.Get();
+      }
+      texture.Reset();
+    }
+    texture = gpu_->CreateTexture(width_, height_, DXGI_FORMAT_NV12,
+                                  D3D11_BIND_VIDEO_ENCODER |
+                                      D3D11_BIND_SHADER_RESOURCE);
+    if (texture == nullptr) {
+      texture = gpu_->CreateTexture(
+          width_, height_, DXGI_FORMAT_NV12,
+          D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+    }
+    return texture.Get();
+  }
+
+  bool WrapFrameD3D11(const webrtc::VideoFrame& frame, ComPtr<IMFSample>* out) {
+    if (pending_.size() >= kInputRing) {
+      // MFT держит всё кольцо — ждать нельзя, кадр пропускаем.
+      RTC_LOG(LS_WARNING) << "MF-enc: энкодер не отдаёт кадры, вход переполнен";
+      return false;
+    }
+    webrtc::scoped_refptr<D3D11FrameBuffer> input =
+        ToD3D11Frame(frame.video_frame_buffer(), gpu_.get());
+    if (input == nullptr) return false;
+    if (input->width() != width_ || input->height() != height_) {
+      input = ToD3D11Frame(input->Scale(width_, height_), gpu_.get());
+      if (input == nullptr) return false;
+    }
+
+    ID3D11Texture2D* texture = RingTexture(ring_slot_);
+    if (texture == nullptr) return false;
+    ring_slot_ = (ring_slot_ + 1) % kInputRing;
+    {
+      webrtc::MutexLock lock(&gpu_->lock());
+      gpu_->context()->CopySubresourceRegion(texture, 0, 0, 0, 0,
+                                             input->texture(),
+                                             input->subresource(), nullptr);
+    }
+
+    ComPtr<IMFMediaBuffer> buffer;
+    if (FAILED(::MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture,
+                                           0, FALSE, &buffer))) {
+      return false;
+    }
+    buffer->SetCurrentLength(
+        static_cast<DWORD>(static_cast<size_t>(width_) * height_ * 3 / 2));
+
+    ComPtr<IMFSample> sample;
+    if (FAILED(::MFCreateSample(&sample))) return false;
+    sample->AddBuffer(buffer.Get());
+    const LONGLONG duration = framerate_ > 0 ? 10000000LL / framerate_ : 333333;
+    sample->SetSampleTime(frame_index_++ * duration);
+    sample->SetSampleDuration(duration);
+    *out = sample;
+    return true;
   }
 
   bool SetOutputType() {
@@ -310,12 +434,22 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     type->SetUINT32(MF_MT_AVG_BITRATE,
                     static_cast<UINT32>(target_bitrate_bps_));
     type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_ConstrainedBase);
+    // High: CABAC и 8x8 — заметно чище текст на том же битрейте. Декодеры на
+    // приёме профиль из SDP не сверяют. Не принял — откат на Constrained Baseline.
+    type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High);
+    type->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+    type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+    type->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+    type->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
     ::MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width_, height_);
     ::MFSetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, framerate_, 1);
     ::MFSetAttributeRatio(type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
-    const HRESULT hr = transform_->SetOutputType(0, type.Get(), 0);
+    HRESULT hr = transform_->SetOutputType(0, type.Get(), 0);
+    if (FAILED(hr)) {
+      type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_ConstrainedBase);
+      hr = transform_->SetOutputType(0, type.Get(), 0);
+    }
     if (FAILED(hr)) {
       RTC_LOG(LS_WARNING) << "MF-enc: SetOutputType hr=" << hr;
       return false;
@@ -349,6 +483,10 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    type->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+    type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+    type->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+    type->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
     ::MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width_, height_);
     ::MFSetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, framerate_, 1);
     ::MFSetAttributeRatio(type.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
@@ -379,11 +517,22 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     SetCodecApiUint32(CODECAPI_AVEncMPVGOPSize, 0);
     SetCodecApiUint32(CODECAPI_AVEncVideoOutputFrameRate,
                       static_cast<UINT32>(framerate_));
+    // B-кадры — это задержка в кадр и переупорядочивание на приёме; Intel без
+    // явного нуля их включает.
+    SetCodecApiUint32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+    // Качество против скорости: аппаратному блоку запаса хватает с большим
+    // запасом, просим тратить его на картинку.
+    SetCodecApiUint32(CODECAPI_AVEncCommonQualityVsSpeed, 70);
+    // VBV в два кадра: без крупных всплесков, но с местом под смену сцены.
+    SetCodecApiUint32(CODECAPI_AVEncCommonBufferSize,
+                      static_cast<UINT32>(target_bitrate_bps_ /
+                                          (framerate_ > 0 ? framerate_ : 30) * 2));
 
     VARIANT low_latency = {};
     low_latency.vt = VT_BOOL;
     low_latency.boolVal = VARIANT_TRUE;
     codec_api_->SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
+    codec_api_->SetValue(&CODECAPI_AVEncCommonLowLatency, &low_latency);
   }
 
   void ApplyBitrate() {
@@ -402,13 +551,17 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     codec_api_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &var);
   }
 
-  // WebRTC отдаёт I420, аппаратный энкодер хочет NV12. Перекладка плоскостей
-  // libyuv — единственное, что тут остаётся на CPU, и стоит она копейки на фоне
-  // самого кодирования.
+  // Запасной путь через системную память. NV12 кладём как есть; I420 перекладываем
+  // плоскостями libyuv. Размер приводим к настроенному — так работает
+  // scaleResolutionDownBy.
   bool WrapFrame(const webrtc::VideoFrame& frame, ComPtr<IMFSample>* out) {
-    const webrtc::scoped_refptr<const webrtc::I420BufferInterface> i420 =
-        frame.video_frame_buffer()->ToI420();
-    if (i420 == nullptr) return false;
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> source =
+        frame.video_frame_buffer();
+    if (source == nullptr) return false;
+    if (source->width() != width_ || source->height() != height_) {
+      source = source->Scale(width_, height_);
+      if (source == nullptr) return false;
+    }
 
     const int y_stride = width_;
     const int uv_stride = width_ % 2 == 0 ? width_ : width_ + 1;
@@ -424,10 +577,40 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
 
     BYTE* data = nullptr;
     if (FAILED(buffer->Lock(&data, nullptr, nullptr))) return false;
-    const int converted = libyuv::I420ToNV12(
-        i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
-        i420->DataV(), i420->StrideV(), data, y_stride, data + y_size,
-        uv_stride, width_, height_);
+
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> nv12;
+    if (source->type() == webrtc::VideoFrameBuffer::Type::kNV12) {
+      nv12 = source;
+    } else if (source->type() == webrtc::VideoFrameBuffer::Type::kNative) {
+      webrtc::VideoFrameBuffer::Type wanted[] = {
+          webrtc::VideoFrameBuffer::Type::kNV12};
+      nv12 = source->GetMappedFrameBuffer(wanted);
+      if (nv12 != nullptr &&
+          nv12->type() != webrtc::VideoFrameBuffer::Type::kNV12) {
+        nv12 = nullptr;
+      }
+    }
+
+    int converted = 0;
+    if (nv12 != nullptr) {
+      const auto* planes =
+          static_cast<const webrtc::NV12BufferInterface*>(nv12.get());
+      libyuv::CopyPlane(planes->DataY(), planes->StrideY(), data, y_stride,
+                        width_, height_);
+      libyuv::CopyPlane(planes->DataUV(), planes->StrideUV(), data + y_size,
+                        uv_stride, width_, (height_ + 1) / 2);
+    } else {
+      const webrtc::scoped_refptr<const webrtc::I420BufferInterface> i420 =
+          source->ToI420();
+      if (i420 == nullptr) {
+        buffer->Unlock();
+        return false;
+      }
+      converted = libyuv::I420ToNV12(
+          i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
+          i420->DataV(), i420->StrideV(), data, y_stride, data + y_size,
+          uv_stride, width_, height_);
+    }
     buffer->Unlock();
     if (converted != 0) return false;
     buffer->SetCurrentLength(static_cast<DWORD>(total));
@@ -617,6 +800,10 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
   ComPtr<IMFTransform> transform_;
   ComPtr<IMFMediaEventGenerator> events_;
   ComPtr<ICodecAPI> codec_api_;
+  ComPtr<IMFDXGIDeviceManager> device_manager_;
+  webrtc::scoped_refptr<GpuContext> gpu_;
+  std::vector<ComPtr<ID3D11Texture2D>> ring_;
+  size_t ring_slot_ = 0;
 
   std::deque<FrameMeta> pending_;
   std::vector<uint8_t> sequence_header_;

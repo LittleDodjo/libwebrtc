@@ -8,6 +8,7 @@
 #include "src/win/nvenc_video_encoder.h"
 
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <string>
 #include <utility>
@@ -23,8 +24,8 @@
 #include "common_video/include/bitrate_adjuster.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
+#include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
-#include "third_party/libyuv/include/libyuv/convert.h"
 
 #if defined(WEBRTC_WIN)
 
@@ -33,6 +34,8 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include "src/win/d3d11_frame_buffer.h"
+#include "src/win/gpu_context.h"
 #include "src/win/nvenc/nvEncodeAPI.h"
 
 #endif  // WEBRTC_WIN
@@ -46,10 +49,10 @@ using Microsoft::WRL::ComPtr;
 
 constexpr UINT kNvidiaVendorId = 0x10DE;
 
-// Отношение к таргетному битрейту, при котором просим NVENC потолок. WebRTC
-// уже прислал нам target — потолок нужен только чтобы всплеск на резкой
-// смене кадров не выбивал буфер.
-constexpr double kMaxBitrateFactor = 1.5;
+// Сколько текстур держим зарегистрированными в NVENC. Пул контекста отдаёт
+// одни и те же текстуры по кругу, поэтому регистрация — разовая операция на
+// текстуру, а не на кадр. Выше потолка — старые снимаем.
+constexpr size_t kMaxRegistrations = 12;
 
 struct NvencApi {
   HMODULE library = nullptr;
@@ -86,54 +89,29 @@ const NvencApi& GetNvencApi() {
   return *api;
 }
 
-// Явно выбираем NVIDIA-адаптер: на ноутбуках с Optimus дефолтный адаптер —
-// встроенная графика, и сессия NVENC на ней не откроется.
-ComPtr<ID3D11Device> CreateNvidiaD3D11Device() {
-  ComPtr<IDXGIFactory1> factory;
-  if (FAILED(::CreateDXGIFactory1(__uuidof(IDXGIFactory1), &factory))) {
-    return nullptr;
-  }
-
-  for (UINT i = 0;; ++i) {
-    ComPtr<IDXGIAdapter1> adapter;
-    if (factory->EnumAdapters1(i, &adapter) == DXGI_ERROR_NOT_FOUND) {
-      break;
-    }
-    DXGI_ADAPTER_DESC1 desc = {};
-    if (FAILED(adapter->GetDesc1(&desc)) || desc.VendorId != kNvidiaVendorId) {
-      continue;
-    }
-
-    ComPtr<ID3D11Device> device;
-    D3D_FEATURE_LEVEL level = {};
-    HRESULT hr = ::D3D11CreateDevice(
-        adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
-        D3D11_SDK_VERSION, &device, &level, nullptr);
-    if (SUCCEEDED(hr)) {
-      return device;
-    }
-  }
-  return nullptr;
+// Устройство для сессии: общее устройство процесса, если оно на NVIDIA —
+// тогда текстуры захвата регистрируются в NVENC без копий. Иначе первый
+// NVIDIA-адаптер (ноутбук с Optimus: экран на встроенной графике, кодирование
+// на дискретной — кадр едет через системную память, как и раньше).
+webrtc::scoped_refptr<GpuContext> NvencGpu() {
+  webrtc::scoped_refptr<GpuContext> shared = GpuContext::Shared();
+  if (shared != nullptr && shared->IsNvidia()) return shared;
+  return GpuContext::ForVendor(kNvidiaVendorId);
 }
 
 class NvencSession {
  public:
   ~NvencSession() { Destroy(); }
 
-  bool Open() {
+  bool Open(webrtc::scoped_refptr<GpuContext> gpu) {
     const NvencApi& api = GetNvencApi();
-    if (!api.loaded) {
-      return false;
-    }
-    device_ = CreateNvidiaD3D11Device();
-    if (device_ == nullptr) {
-      return false;
-    }
+    if (!api.loaded || gpu == nullptr) return false;
+    gpu_ = std::move(gpu);
 
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS params = {};
     params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
     params.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
-    params.device = device_.Get();
+    params.device = gpu_->device();
     params.apiVersion = NVENCAPI_VERSION;
     const NVENCSTATUS status =
         api.fn.nvEncOpenEncodeSessionEx(&params, &encoder_);
@@ -147,9 +125,7 @@ class NvencSession {
 
   bool SupportsH264() {
     const NvencApi& api = GetNvencApi();
-    if (encoder_ == nullptr) {
-      return false;
-    }
+    if (encoder_ == nullptr) return false;
     uint32_t count = 0;
     if (api.fn.nvEncGetEncodeGUIDCount(encoder_, &count) != NV_ENC_SUCCESS ||
         count == 0) {
@@ -169,29 +145,46 @@ class NvencSession {
     return false;
   }
 
+  int Cap(NV_ENC_CAPS cap) {
+    const NvencApi& api = GetNvencApi();
+    if (encoder_ == nullptr) return 0;
+    NV_ENC_CAPS_PARAM param = {};
+    param.version = NV_ENC_CAPS_PARAM_VER;
+    param.capsToQuery = cap;
+    int value = 0;
+    if (api.fn.nvEncGetEncodeCaps(encoder_, NV_ENC_CODEC_H264_GUID, &param,
+                                  &value) != NV_ENC_SUCCESS) {
+      return 0;
+    }
+    return value;
+  }
+
   void Destroy() {
     if (encoder_ != nullptr) {
       GetNvencApi().fn.nvEncDestroyEncoder(encoder_);
       encoder_ = nullptr;
     }
-    device_.Reset();
+    gpu_ = nullptr;
   }
 
   void* encoder() const { return encoder_; }
+  GpuContext* gpu() const { return gpu_.get(); }
 
  private:
-  ComPtr<ID3D11Device> device_;
+  webrtc::scoped_refptr<GpuContext> gpu_;
   void* encoder_ = nullptr;
 };
 
 bool ProbeNvencH264() {
   NvencSession session;
-  if (!session.Open()) {
-    RTC_LOG(LS_INFO) << "NVENC: сессия не открылась — уходим на софт";
+  if (!session.Open(NvencGpu())) {
+    RTC_LOG(LS_INFO) << "NVENC: сессия не открылась — уходим дальше по цепочке";
     return false;
   }
   const bool ok = session.SupportsH264();
-  RTC_LOG(LS_INFO) << "NVENC: H.264 " << (ok ? "доступен" : "не поддержан");
+  RTC_LOG(LS_INFO) << "NVENC: H.264 " << (ok ? "доступен" : "не поддержан")
+                   << ", zero-copy="
+                   << (session.gpu() == GpuContext::Shared().get() ? "да" : "нет");
   return ok;
 }
 
@@ -213,8 +206,8 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
 
     Release();
 
-    width_ = codec_settings->width;
-    height_ = codec_settings->height;
+    width_ = codec_settings->width & ~1;
+    height_ = codec_settings->height & ~1;
     framerate_ = codec_settings->maxFramerate > 0
                      ? static_cast<int>(codec_settings->maxFramerate)
                      : 30;
@@ -237,15 +230,16 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   int32_t Release() override {
     const NvencApi& api = GetNvencApi();
     if (session_.encoder() != nullptr) {
-      if (input_buffer_ != nullptr) {
-        api.fn.nvEncDestroyInputBuffer(session_.encoder(), input_buffer_);
-        input_buffer_ = nullptr;
+      for (auto& registration : registrations_) {
+        api.fn.nvEncUnregisterResource(session_.encoder(),
+                                       registration.handle);
       }
       if (output_buffer_ != nullptr) {
         api.fn.nvEncDestroyBitstreamBuffer(session_.encoder(), output_buffer_);
         output_buffer_ = nullptr;
       }
     }
+    registrations_.clear();
     session_.Destroy();
     return WEBRTC_VIDEO_CODEC_OK;
   }
@@ -253,12 +247,8 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   int32_t Encode(
       const webrtc::VideoFrame& frame,
       const std::vector<webrtc::VideoFrameType>* frame_types) override {
-    if (session_.encoder() == nullptr) {
-      return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
-    }
-    if (callback_ == nullptr) {
-      return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
-    }
+    if (session_.encoder() == nullptr) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+    if (callback_ == nullptr) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
 
     bool key_frame = false;
     if (frame_types != nullptr && !frame_types->empty()) {
@@ -268,60 +258,76 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
       key_frame = (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
     }
 
-    if (frame.width() != width_ || frame.height() != height_) {
-      width_ = frame.width();
-      height_ = frame.height();
-      Release();
-      const int result = OpenEncoder();
-      if (result != WEBRTC_VIDEO_CODEC_OK) {
-        return result;
-      }
-      key_frame = true;
-    }
+    if (reconfigure_needed_ && !Reconfigure()) return WEBRTC_VIDEO_CODEC_ERROR;
 
-    if (reconfigure_needed_ && !Reconfigure()) {
+    // Кадр — текстура на устройстве сессии. Нативный кадр с того же
+    // устройства остаётся собой; всё остальное (NV12 или I420 из памяти,
+    // текстура другого адаптера) заливается один раз. Размер приводим к
+    // настроенному на видеокарте: так scaleResolutionDownBy работает, а не
+    // пересоздаёт энкодер под размер входа.
+    webrtc::scoped_refptr<D3D11FrameBuffer> input =
+        ToD3D11Frame(frame.video_frame_buffer(), session_.gpu());
+    if (input == nullptr) {
+      RTC_LOG(LS_ERROR) << "NVENC: кадр не лёг на устройство";
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
-
-    if (!FillInputBuffer(frame)) {
-      return WEBRTC_VIDEO_CODEC_ERROR;
+    if (input->width() != width_ || input->height() != height_) {
+      input = ToD3D11Frame(input->Scale(width_, height_), session_.gpu());
+      if (input == nullptr) return WEBRTC_VIDEO_CODEC_ERROR;
     }
 
+    // В энкодер приходят только текстуры пула — не массивы, нулевой подресурс.
+    RTC_DCHECK_EQ(input->subresource(), 0u);
     const NvencApi& api = GetNvencApi();
+    NV_ENC_REGISTERED_PTR registered = Register(input->texture());
+    if (registered == nullptr) return WEBRTC_VIDEO_CODEC_ERROR;
+
+    NV_ENC_MAP_INPUT_RESOURCE map = {};
+    map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+    map.registeredResource = registered;
+    if (api.fn.nvEncMapInputResource(session_.encoder(), &map) !=
+        NV_ENC_SUCCESS) {
+      RTC_LOG(LS_ERROR) << "NVENC: nvEncMapInputResource failed";
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+
     NV_ENC_PIC_PARAMS pic = {};
     pic.version = NV_ENC_PIC_PARAMS_VER;
-    pic.inputBuffer = input_buffer_;
+    pic.inputBuffer = map.mappedResource;
+    pic.bufferFmt = map.mappedBufferFmt;
     pic.outputBitstream = output_buffer_;
-    pic.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
     pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     pic.inputWidth = width_;
     pic.inputHeight = height_;
+    pic.inputPitch = 0;
     pic.inputTimeStamp = frame.rtp_timestamp();
     if (key_frame) {
       pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR |
-                           NV_ENC_PIC_FLAG_FORCEINTRA |
                            NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
     }
 
-    if (api.fn.nvEncEncodePicture(session_.encoder(), &pic) != NV_ENC_SUCCESS) {
-      RTC_LOG(LS_ERROR) << "NVENC: nvEncEncodePicture failed";
-      return WEBRTC_VIDEO_CODEC_ERROR;
+    const NVENCSTATUS status =
+        api.fn.nvEncEncodePicture(session_.encoder(), &pic);
+    int32_t result = WEBRTC_VIDEO_CODEC_OK;
+    if (status != NV_ENC_SUCCESS) {
+      RTC_LOG(LS_ERROR) << "NVENC: nvEncEncodePicture status=" << status;
+      result = WEBRTC_VIDEO_CODEC_ERROR;
+    } else {
+      result = DeliverBitstream(frame);
     }
-
-    return DeliverBitstream(frame);
+    // Текстуру отпускаем только после того, как битстрим прочитан: до этого
+    // NVENC может ещё читать из неё.
+    api.fn.nvEncUnmapInputResource(session_.encoder(), map.mappedResource);
+    return result;
   }
 
   void SetRates(const RateControlParameters& parameters) override {
-    if (parameters.bitrate.get_sum_bps() == 0) {
-      return;
-    }
+    if (parameters.bitrate.get_sum_bps() == 0) return;
     const int target = static_cast<int>(parameters.bitrate.get_sum_bps());
     const int framerate = parameters.framerate_fps > 1.0
-                              ? static_cast<int>(parameters.framerate_fps)
+                              ? static_cast<int>(parameters.framerate_fps + 0.5)
                               : framerate_;
-    if (target == target_bitrate_bps_ && framerate == framerate_) {
-      return;
-    }
+    if (target == target_bitrate_bps_ && framerate == framerate_) return;
     target_bitrate_bps_ = target;
     framerate_ = framerate;
     bitrate_adjuster_.SetTargetBitrateBps(target);
@@ -332,8 +338,13 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     webrtc::VideoEncoder::EncoderInfo info;
     info.implementation_name = "NVENC H264";
     info.is_hardware_accelerated = true;
-    info.supports_native_handle = false;
+    // Кадры в видеопамяти принимаем как есть; из памяти предпочитаем NV12 —
+    // ровно то, что отдаёт захват, без лишнего перекладывания плоскостей.
+    info.supports_native_handle = true;
+    info.preferred_pixel_formats = {webrtc::VideoFrameBuffer::Type::kNV12};
     info.has_trusted_rate_controller = false;
+    info.requested_resolution_alignment = 2;
+    info.apply_alignment_to_all_simulcast_layers = true;
     info.scaling_settings = webrtc::VideoEncoder::ScalingSettings(kLowQp, kHighQp);
     return info;
   }
@@ -342,37 +353,69 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   static constexpr int kLowQp = 24;
   static constexpr int kHighQp = 37;
 
+  struct Registration {
+    ComPtr<ID3D11Texture2D> texture;
+    NV_ENC_REGISTERED_PTR handle = nullptr;
+  };
+
   int OpenEncoder() {
-    if (!session_.Open()) {
-      return WEBRTC_VIDEO_CODEC_ERROR;
-    }
+    if (!session_.Open(NvencGpu())) return WEBRTC_VIDEO_CODEC_ERROR;
     const NvencApi& api = GetNvencApi();
 
     NV_ENC_PRESET_CONFIG preset = {};
     preset.version = NV_ENC_PRESET_CONFIG_VER;
     preset.presetCfg.version = NV_ENC_CONFIG_VER;
     if (api.fn.nvEncGetEncodePresetConfigEx(
-            session_.encoder(), NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID,
+            session_.encoder(), NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID,
             NV_ENC_TUNING_INFO_LOW_LATENCY, &preset) != NV_ENC_SUCCESS) {
       Release();
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
 
     config_ = preset.presetCfg;
-    ApplyRateControl(&config_);
+    // High только там, где железо умеет CABAC; иначе остаёмся на профиле пресета.
+    const bool cabac = session_.Cap(NV_ENC_CAPS_SUPPORT_CABAC) != 0;
+    const bool transform_8x8 =
+        session_.Cap(NV_ENC_CAPS_SUPPORT_ADAPTIVE_TRANSFORM) != 0;
+    if (cabac) config_.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
     // Бесконечный GOP: ключевые кадры шлём только по запросу WebRTC, он сам
     // просит их при потерях и при подключении нового зрителя.
     config_.gopLength = NVENC_INFINITE_GOPLENGTH;
     config_.frameIntervalP = 1;
-    config_.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-    config_.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-    config_.encodeCodecConfig.h264Config.sliceMode = 0;
-    config_.encodeCodecConfig.h264Config.sliceModeData = 0;
+    ApplyRateControl(&config_);
+
+    NV_ENC_CONFIG_H264& h264 = config_.encodeCodecConfig.h264Config;
+    h264.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+    h264.repeatSPSPPS = 1;
+    h264.sliceMode = 0;
+    h264.sliceModeData = 0;
+    h264.level = NV_ENC_LEVEL_AUTOSELECT;
+    h264.chromaFormatIDC = 1;
+    // High profile: CABAC и адаптивное преобразование 8x8 дают 10-15% к
+    // качеству на том же битрейте. Декодеры приёмной стороны (MediaFoundation,
+    // VideoToolbox) профиль из SDP не сверяют.
+    if (cabac) h264.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
+    if (transform_8x8) {
+      h264.adaptiveTransformMode = NV_ENC_H264_ADAPTIVE_TRANSFORM_ENABLE;
+    }
+    h264.outputBufferingPeriodSEI = 0;
+    h264.outputPictureTimingSEI = 0;
+    h264.enableFillerDataInsertion = 0;
+    // Цвет объявляем явно: BT.709, студийный диапазон. Декодер и рендер на
+    // другой стороне берут матрицу отсюда, а не угадывают по разрешению.
+    h264.h264VUIParameters.videoSignalTypePresentFlag = 1;
+    h264.h264VUIParameters.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+    h264.h264VUIParameters.videoFullRangeFlag = 0;
+    h264.h264VUIParameters.colourDescriptionPresentFlag = 1;
+    h264.h264VUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+    h264.h264VUIParameters.transferCharacteristics =
+        NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+    h264.h264VUIParameters.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
 
     init_params_ = {};
     init_params_.version = NV_ENC_INITIALIZE_PARAMS_VER;
     init_params_.encodeGUID = NV_ENC_CODEC_H264_GUID;
-    init_params_.presetGUID = NV_ENC_PRESET_P3_GUID;
+    init_params_.presetGUID = NV_ENC_PRESET_P4_GUID;
     init_params_.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
     init_params_.encodeWidth = width_;
     init_params_.encodeHeight = height_;
@@ -385,29 +428,18 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     init_params_.enablePTD = 1;
     init_params_.encodeConfig = &config_;
 
-    if (api.fn.nvEncInitializeEncoder(session_.encoder(), &init_params_) !=
-        NV_ENC_SUCCESS) {
-      RTC_LOG(LS_ERROR) << "NVENC: nvEncInitializeEncoder failed";
+    NVENCSTATUS status =
+        api.fn.nvEncInitializeEncoder(session_.encoder(), &init_params_);
+    if (status != NV_ENC_SUCCESS) {
+      RTC_LOG(LS_ERROR) << "NVENC: nvEncInitializeEncoder status=" << status;
       Release();
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
-
-    NV_ENC_CREATE_INPUT_BUFFER input = {};
-    input.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-    input.width = width_;
-    input.height = height_;
-    input.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
-    if (api.fn.nvEncCreateInputBuffer(session_.encoder(), &input) !=
-        NV_ENC_SUCCESS) {
-      Release();
-      return WEBRTC_VIDEO_CODEC_ERROR;
-    }
-    input_buffer_ = input.inputBuffer;
 
     NV_ENC_CREATE_BITSTREAM_BUFFER output = {};
     output.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-    if (api.fn.nvEncCreateBitstreamBuffer(session_.encoder(), &output) !=
-        NV_ENC_SUCCESS) {
+    status = api.fn.nvEncCreateBitstreamBuffer(session_.encoder(), &output);
+    if (status != NV_ENC_SUCCESS) {
       Release();
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
@@ -416,7 +448,8 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     reconfigure_needed_ = false;
     RTC_LOG(LS_INFO) << "NVENC: инициализирован " << width_ << "x" << height_
                      << "@" << framerate_ << " " << target_bitrate_bps_
-                     << " bit/s";
+                     << " bit/s, P4 low-latency, two-pass, cabac=" << cabac
+                     << " 8x8=" << transform_8x8;
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
@@ -424,16 +457,26 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     const uint32_t average = bitrate_adjuster_.GetAdjustedBitrateBps() > 0
                                  ? bitrate_adjuster_.GetAdjustedBitrateBps()
                                  : target_bitrate_bps_;
+    const uint32_t fps = framerate_ > 0 ? framerate_ : 30;
     config->rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
     config->rcParams.averageBitRate = average;
-    config->rcParams.maxBitRate =
-        static_cast<uint32_t>(average * kMaxBitrateFactor);
+    config->rcParams.maxBitRate = average;
+    // Два прохода (первый в четверть разрешения) — распределение битов по
+    // кадру заметно ровнее, особенно на тексте и резких границах.
+    config->rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
     config->rcParams.enableAQ = 1;
+    config->rcParams.enableTemporalAQ = 0;
+    config->rcParams.enableLookahead = 0;
     config->rcParams.disableBadapt = 1;
-    // Буфер размером в один кадр — это и есть low latency: энкодеру нечем
-    // «занять» будущие кадры, поэтому он не копит задержку.
-    config->rcParams.vbvBufferSize = average / (framerate_ > 0 ? framerate_ : 30);
+    config->rcParams.zeroReorderDelay = 1;
+    config->rcParams.enableNonRefP = 0;
+    // VBV в один кадр — это и есть low latency: энкодеру нечем «занять»
+    // будущие кадры, поэтому он не копит задержку. Ключевой кадр при этом
+    // может быть втрое крупнее P-кадра: его ждут новые зрители и восстановление
+    // после потерь, и мыльный IDR там хуже короткого всплеска.
+    config->rcParams.vbvBufferSize = average / fps;
     config->rcParams.vbvInitialDelay = config->rcParams.vbvBufferSize;
+    config->rcParams.lowDelayKeyFrameScale = 3;
   }
 
   bool Reconfigure() {
@@ -445,6 +488,8 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     NV_ENC_RECONFIGURE_PARAMS params = {};
     params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
     params.reInitEncodeParams = init_params_;
+    params.resetEncoder = 0;
+    params.forceIDR = 0;
     if (api.fn.nvEncReconfigureEncoder(session_.encoder(), &params) !=
         NV_ENC_SUCCESS) {
       RTC_LOG(LS_WARNING) << "NVENC: nvEncReconfigureEncoder failed";
@@ -454,29 +499,40 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     return true;
   }
 
-  bool FillInputBuffer(const webrtc::VideoFrame& frame) {
+  NV_ENC_REGISTERED_PTR Register(ID3D11Texture2D* texture) {
+    for (const auto& registration : registrations_) {
+      if (registration.texture.Get() == texture) return registration.handle;
+    }
     const NvencApi& api = GetNvencApi();
-    NV_ENC_LOCK_INPUT_BUFFER lock = {};
-    lock.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-    lock.inputBuffer = input_buffer_;
-    if (api.fn.nvEncLockInputBuffer(session_.encoder(), &lock) !=
-        NV_ENC_SUCCESS) {
-      RTC_LOG(LS_ERROR) << "NVENC: nvEncLockInputBuffer failed";
-      return false;
+    if (registrations_.size() >= kMaxRegistrations) {
+      api.fn.nvEncUnregisterResource(session_.encoder(),
+                                     registrations_.front().handle);
+      registrations_.pop_front();
     }
 
-    auto* dst_y = static_cast<uint8_t*>(lock.bufferDataPtr);
-    uint8_t* dst_uv = dst_y + static_cast<size_t>(height_) * lock.pitch;
-
-    webrtc::scoped_refptr<const webrtc::I420BufferInterface> i420 =
-        frame.video_frame_buffer()->ToI420();
-    const int result = libyuv::I420ToNV12(
-        i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
-        i420->DataV(), i420->StrideV(), dst_y, lock.pitch, dst_uv, lock.pitch,
-        width_, height_);
-
-    api.fn.nvEncUnlockInputBuffer(session_.encoder(), input_buffer_);
-    return result == 0;
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    NV_ENC_REGISTER_RESOURCE reg = {};
+    reg.version = NV_ENC_REGISTER_RESOURCE_VER;
+    reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+    reg.resourceToRegister = texture;
+    reg.width = desc.Width;
+    reg.height = desc.Height;
+    reg.pitch = 0;
+    reg.subResourceIndex = 0;
+    reg.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+    reg.bufferUsage = NV_ENC_INPUT_IMAGE;
+    const NVENCSTATUS status =
+        api.fn.nvEncRegisterResource(session_.encoder(), &reg);
+    if (status != NV_ENC_SUCCESS) {
+      RTC_LOG(LS_ERROR) << "NVENC: nvEncRegisterResource status=" << status;
+      return nullptr;
+    }
+    Registration registration;
+    registration.texture = texture;
+    registration.handle = reg.registeredResource;
+    registrations_.push_back(registration);
+    return registration.handle;
   }
 
   int32_t DeliverBitstream(const webrtc::VideoFrame& frame) {
@@ -498,6 +554,7 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     const uint32_t size = lock.bitstreamSizeInBytes;
     const bool key_frame = lock.pictureType == NV_ENC_PIC_TYPE_IDR ||
                            lock.pictureType == NV_ENC_PIC_TYPE_I;
+    const int avg_qp = static_cast<int>(lock.frameAvgQP);
     api.fn.nvEncUnlockBitstream(session_.encoder(), output_buffer_);
 
     image._encodedWidth = width_;
@@ -514,13 +571,18 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     image._frameType = key_frame ? webrtc::VideoFrameType::kVideoFrameKey
                                  : webrtc::VideoFrameType::kVideoFrameDelta;
 
-    bitstream_parser_.ParseBitstream(image);
-    image.qp_ = bitstream_parser_.GetLastSliceQp().value_or(-1);
+    if (avg_qp > 0 && avg_qp <= 51) {
+      image.qp_ = avg_qp;
+    } else {
+      bitstream_parser_.ParseBitstream(image);
+      image.qp_ = bitstream_parser_.GetLastSliceQp().value_or(-1);
+    }
 
     webrtc::CodecSpecificInfo codec_specific;
     codec_specific.codecType = webrtc::kVideoCodecH264;
     codec_specific.codecSpecific.H264.packetization_mode =
         webrtc::H264PacketizationMode::NonInterleaved;
+    codec_specific.codecSpecific.H264.idr_frame = key_frame;
 
     const webrtc::EncodedImageCallback::Result result =
         callback_->OnEncodedImage(image, &codec_specific);
@@ -534,8 +596,8 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   NvencSession session_;
   NV_ENC_INITIALIZE_PARAMS init_params_ = {};
   NV_ENC_CONFIG config_ = {};
-  NV_ENC_INPUT_PTR input_buffer_ = nullptr;
   NV_ENC_OUTPUT_PTR output_buffer_ = nullptr;
+  std::deque<Registration> registrations_;
 
   webrtc::EncodedImageCallback* callback_ = nullptr;
   webrtc::H264BitstreamParser bitstream_parser_;
@@ -566,9 +628,7 @@ std::unique_ptr<webrtc::VideoEncoder> CreateNvencH264Encoder(
     const webrtc::Environment& /* env */,
     const webrtc::SdpVideoFormat& /* format */) {
 #if defined(WEBRTC_WIN)
-  if (!NvencH264Supported()) {
-    return nullptr;
-  }
+  if (!NvencH264Supported()) return nullptr;
   return std::make_unique<NvencH264Encoder>();
 #else
   return nullptr;

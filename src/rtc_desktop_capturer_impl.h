@@ -91,6 +91,11 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   webrtc::DesktopCapturer::SourceId source_id_;
   DesktopCapturerObserver* observer_ = nullptr;
   uint32_t capture_delay_ = 1000;  // 1s
+  // Дедлайн следующего тика запасного пути webrtc (TimeMicros).
+  int64_t next_capture_us_ = 0;
+#ifdef WEBRTC_WIN
+  bool timer_period_raised_ = false;
+#endif
   webrtc::DesktopCapturer::Result result_ =
       webrtc::DesktopCapturer::Result::SUCCESS;
   webrtc::Thread* signaling_thread_ = nullptr;

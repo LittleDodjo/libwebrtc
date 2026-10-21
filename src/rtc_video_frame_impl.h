@@ -39,6 +39,11 @@ class VideoFrameBufferImpl : public RTCVideoFrame {
   int ConvertToARGB(Type type, uint8_t* dst_argb, int dst_stride_argb,
                     int dest_width, int dest_height) override;
 
+  void* d3d11_texture() const override;
+
+  bool RenderToD3D11Texture(void* texture, int x, int y, int width,
+                            int height) override;
+
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer() { return buffer_; }
 
   // System monotonic clock, same timebase as webrtc::TimeMicros().
@@ -52,7 +57,10 @@ class VideoFrameBufferImpl : public RTCVideoFrame {
   void set_rotation(webrtc::VideoRotation rotation) { rotation_ = rotation; }
 
  private:
+  const webrtc::I420BufferInterface* I420() const;
+
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer_;
+  mutable webrtc::scoped_refptr<webrtc::I420BufferInterface> i420_;
   int64_t timestamp_us_ = 0;
   webrtc::VideoRotation rotation_ = webrtc::kVideoRotation_0;
 };

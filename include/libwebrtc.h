@@ -53,6 +53,26 @@ class LibWebRTC {
    *
    */
   LIB_WEBRTC_API static void Terminate();
+
+  /**
+   * @brief Порядок аппаратных H.264-энкодеров на Windows.
+   *
+   * Имена через запятую из "nvenc", "amf", "mf"; по умолчанию именно такой
+   * порядок. Пустая строка — только софтовый OpenH264. Операционный
+   * предохранитель: сломанный драйвер выключается настройкой, без пересборки.
+   * На других платформах не делает ничего.
+   */
+  LIB_WEBRTC_API static void SetHardwareEncoderOrder(const string& csv);
+
+  /**
+   * @brief Общее D3D11-устройство движка (Windows): ID3D11Device*, без AddRef.
+   *
+   * На нём живут кадры захвата и декодера. Рендер, создавший swap chain или
+   * текстуру на этом устройстве, получает кадр через
+   * RTCVideoFrame::RenderToD3D11Texture без единого байта через шину.
+   * Устройство живёт до конца процесса. nullptr вне Windows или без D3D11.
+   */
+  LIB_WEBRTC_API static void* GetD3D11Device();
 };
 
 }  // namespace libwebrtc
