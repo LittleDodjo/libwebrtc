@@ -188,6 +188,8 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     device_manager_.Reset();
     ring_.clear();
     ring_slot_ = 0;
+    d3d_failures_ = 0;
+    d3d_input_failed_ = false;
     gpu_ = nullptr;
     pending_.clear();
     sequence_header_.clear();
@@ -216,10 +218,13 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     if (key_frame) ForceKeyFrame();
 
     ComPtr<IMFSample> sample;
-    if (gpu_ != nullptr) {
+    const bool d3d_sample = gpu_ != nullptr && !d3d_input_failed_;
+    if (d3d_sample) {
       if (!WrapFrameD3D11(frame, &sample)) {
         // Текстурный путь не сложился (переполнение, нет видеопамяти) —
-        // пропускаем кадр, следующий пойдёт штатно.
+        // пропускаем кадр. Серия отказов — путь не работает, дальше через
+        // системную память: чёрный экран хуже лишней копии.
+        if (++d3d_failures_ >= 30) DisableD3DInput();
         PumpEvents(/*block=*/false);
         return WEBRTC_VIDEO_CODEC_OK;
       }
@@ -232,8 +237,14 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     const HRESULT hr = transform_->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) {
       RTC_LOG(LS_WARNING) << "MF-enc: ProcessInput hr=" << hr;
+      if (d3d_sample) {
+        // MFT не принял текстуру — следующие кадры пойдут буферами в памяти.
+        DisableD3DInput();
+        return WEBRTC_VIDEO_CODEC_OK;
+      }
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
+    d3d_failures_ = 0;
     if (need_input_ > 0) need_input_--;
 
     pending_.push_back({frame.rtp_timestamp(), frame.ntp_time_ms(),
@@ -356,6 +367,14 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
     }
     device_manager_ = manager;
     gpu_ = gpu;
+  }
+
+  void DisableD3DInput() {
+    if (d3d_input_failed_) return;
+    d3d_input_failed_ = true;
+    ring_.clear();
+    RTC_LOG(LS_WARNING) << "MF-enc: текстурный вход не работает, кодируем из "
+                           "системной памяти";
   }
 
   // Своя текстура под вход MFT: с флагом VIDEO_ENCODER, которого у текстур пула
@@ -804,6 +823,8 @@ class MediaFoundationH264Encoder : public webrtc::VideoEncoder {
   webrtc::scoped_refptr<GpuContext> gpu_;
   std::vector<ComPtr<ID3D11Texture2D>> ring_;
   size_t ring_slot_ = 0;
+  int d3d_failures_ = 0;
+  bool d3d_input_failed_ = false;
 
   std::deque<FrameMeta> pending_;
   std::vector<uint8_t> sequence_header_;

@@ -301,24 +301,70 @@ class GpuScreenCapturer::Impl {
           if (cursor_visible_) DrawCursor();
           input = composed_.Get();
         }
-        auto frame = gpu_->CreateNV12Frame(out_width, out_height);
+        // После серии отказов GPU-путь пробуем реже, чтобы не засыпать лог
+        // отказами CreateTexture2D шестьдесят раз в секунду.
+        const bool try_gpu = gpu_failures_ < kGpuFailuresBeforeReadback ||
+                             gpu_failures_ % 120 == 0;
+        webrtc::scoped_refptr<D3D11FrameBuffer> frame =
+            try_gpu ? gpu_->CreateNV12Frame(out_width, out_height) : nullptr;
         if (frame != nullptr &&
             gpu_->Blit(input, 0, nullptr, frame->texture(), 0, nullptr,
                        /*letterbox=*/false)) {
-          if (last_ == nullptr || last_->width() != out_width ||
-              last_->height() != out_height) {
-            RTC_LOG(LS_INFO) << "GPU-capture: " << input_width_ << "x"
-                             << input_height_ << " -> " << out_width << "x"
-                             << out_height;
-          }
+          LogOutputSize(out_width, out_height);
           last_ = frame;
+          gpu_failures_ = 0;
+        } else if (++gpu_failures_ >= kGpuFailuresBeforeReadback) {
+          // Пул не отдаёт текстуры или видеопроцессор не пишет в них — обычно
+          // драйвер, не принимающий общие NV12-текстуры. Чёрный экран хуже
+          // чтения через шину: уходим на прежний путь с readback.
+          auto host = ReadbackFrame(input, out_width, out_height);
+          if (host != nullptr) {
+            LogOutputSize(out_width, out_height);
+            last_ = host;
+          }
         }
-        // frame == nullptr: все текстуры пула заняты энкодером — кадр
-        // пропускаем, повторим предыдущий.
+        // Иначе пул занят энкодером на кадр-другой — повторим предыдущий.
       }
       dirty_ = false;
     }
     if (last_ != nullptr) callback_(last_, webrtc::TimeMicros());
+  }
+
+  void LogOutputSize(int out_width, int out_height) {
+    if (last_ != nullptr && last_->width() == out_width &&
+        last_->height() == out_height) {
+      return;
+    }
+    RTC_LOG(LS_INFO) << "GPU-capture: " << input_width_ << "x" << input_height_
+                     << " -> " << out_width << "x" << out_height
+                     << (gpu_failures_ >= kGpuFailuresBeforeReadback
+                             ? " (readback)"
+                             : "");
+  }
+
+  // Запасной путь: блит в свою необщую NV12-текстуру и чтение в память — то,
+  // что делал захват до nvenc.8.
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> ReadbackFrame(
+      ID3D11Texture2D* input, int out_width, int out_height) {
+    if (readback_nv12_ != nullptr) {
+      D3D11_TEXTURE2D_DESC desc = {};
+      readback_nv12_->GetDesc(&desc);
+      if (desc.Width != static_cast<UINT>(out_width) ||
+          desc.Height != static_cast<UINT>(out_height)) {
+        readback_nv12_.Reset();
+      }
+    }
+    if (readback_nv12_ == nullptr) {
+      readback_nv12_ = gpu_->CreateTexture(out_width, out_height,
+                                           DXGI_FORMAT_NV12,
+                                           D3D11_BIND_RENDER_TARGET);
+      if (readback_nv12_ == nullptr) return nullptr;
+    }
+    if (!gpu_->Blit(input, 0, nullptr, readback_nv12_.Get(), 0, nullptr,
+                    /*letterbox=*/false)) {
+      return nullptr;
+    }
+    return gpu_->ReadbackNV12(readback_nv12_.Get(), 0, out_width, out_height);
   }
 
   void ReadCursorShape(const DXGI_OUTDUPL_FRAME_INFO& info) {
@@ -551,7 +597,11 @@ class GpuScreenCapturer::Impl {
   UINT input_height_ = 0;
   // Есть что собирать к дедлайну: новая картинка стола или движение курсора.
   bool dirty_ = false;
-  webrtc::scoped_refptr<D3D11FrameBuffer> last_;
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> last_;
+  // Подряд неудачных попыток получить кадр в видеопамяти; от трёх — readback.
+  static constexpr int kGpuFailuresBeforeReadback = 3;
+  int gpu_failures_ = 0;
+  ComPtr<ID3D11Texture2D> readback_nv12_;
 
   std::atomic<int> target_width_{0};
   std::atomic<int> target_height_{0};

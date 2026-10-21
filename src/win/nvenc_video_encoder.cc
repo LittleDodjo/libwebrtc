@@ -26,6 +26,7 @@
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
+#include "third_party/libyuv/include/libyuv/planar_functions.h"
 
 #if defined(WEBRTC_WIN)
 
@@ -234,11 +235,15 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
         api.fn.nvEncUnregisterResource(session_.encoder(),
                                        registration.handle);
       }
+      if (input_buffer_ != nullptr) {
+        api.fn.nvEncDestroyInputBuffer(session_.encoder(), input_buffer_);
+      }
       if (output_buffer_ != nullptr) {
         api.fn.nvEncDestroyBitstreamBuffer(session_.encoder(), output_buffer_);
-        output_buffer_ = nullptr;
       }
     }
+    input_buffer_ = nullptr;
+    output_buffer_ = nullptr;
     registrations_.clear();
     session_.Destroy();
     return WEBRTC_VIDEO_CODEC_OK;
@@ -279,22 +284,40 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     // В энкодер приходят только текстуры пула — не массивы, нулевой подресурс.
     RTC_DCHECK_EQ(input->subresource(), 0u);
     const NvencApi& api = GetNvencApi();
-    NV_ENC_REGISTERED_PTR registered = Register(input->texture());
-    if (registered == nullptr) return WEBRTC_VIDEO_CODEC_ERROR;
 
+    // Текстура напрямую; если драйвер её не регистрирует — прежний путь через
+    // входной буфер в системной памяти. Чёрный экран хуже лишней копии.
     NV_ENC_MAP_INPUT_RESOURCE map = {};
-    map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-    map.registeredResource = registered;
-    if (api.fn.nvEncMapInputResource(session_.encoder(), &map) !=
-        NV_ENC_SUCCESS) {
-      RTC_LOG(LS_ERROR) << "NVENC: nvEncMapInputResource failed";
-      return WEBRTC_VIDEO_CODEC_ERROR;
+    NV_ENC_INPUT_PTR picture_input = nullptr;
+    NV_ENC_BUFFER_FORMAT picture_format = NV_ENC_BUFFER_FORMAT_NV12;
+    if (!host_input_) {
+      NV_ENC_REGISTERED_PTR registered = Register(input->texture());
+      if (registered != nullptr) {
+        map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+        map.registeredResource = registered;
+        if (api.fn.nvEncMapInputResource(session_.encoder(), &map) ==
+            NV_ENC_SUCCESS) {
+          picture_input = map.mappedResource;
+          picture_format = map.mappedBufferFmt;
+        } else {
+          map.mappedResource = nullptr;
+        }
+      }
+      if (picture_input == nullptr) {
+        RTC_LOG(LS_WARNING) << "NVENC: текстуры не регистрируются, кодируем из "
+                               "системной памяти";
+        host_input_ = true;
+      }
+    }
+    if (host_input_) {
+      if (!FillHostInput(*input)) return WEBRTC_VIDEO_CODEC_ERROR;
+      picture_input = input_buffer_;
     }
 
     NV_ENC_PIC_PARAMS pic = {};
     pic.version = NV_ENC_PIC_PARAMS_VER;
-    pic.inputBuffer = map.mappedResource;
-    pic.bufferFmt = map.mappedBufferFmt;
+    pic.inputBuffer = picture_input;
+    pic.bufferFmt = picture_format;
     pic.outputBitstream = output_buffer_;
     pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     pic.inputWidth = width_;
@@ -317,8 +340,48 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     }
     // Текстуру отпускаем только после того, как битстрим прочитан: до этого
     // NVENC может ещё читать из неё.
-    api.fn.nvEncUnmapInputResource(session_.encoder(), map.mappedResource);
+    if (map.mappedResource != nullptr) {
+      api.fn.nvEncUnmapInputResource(session_.encoder(), map.mappedResource);
+    }
     return result;
+  }
+
+  // Запасной вход: буфер NVENC в системной памяти, кадр читается с видеокарты
+  // один раз (ReadbackNV12 кэшируется в кадре) и копируется плоскостями.
+  bool FillHostInput(D3D11FrameBuffer& input) {
+    const NvencApi& api = GetNvencApi();
+    if (input_buffer_ == nullptr) {
+      NV_ENC_CREATE_INPUT_BUFFER create = {};
+      create.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+      create.width = width_;
+      create.height = height_;
+      create.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+      if (api.fn.nvEncCreateInputBuffer(session_.encoder(), &create) !=
+          NV_ENC_SUCCESS) {
+        RTC_LOG(LS_ERROR) << "NVENC: nvEncCreateInputBuffer failed";
+        return false;
+      }
+      input_buffer_ = create.inputBuffer;
+    }
+    webrtc::scoped_refptr<webrtc::NV12Buffer> host = input.ReadbackNV12();
+    if (host == nullptr) return false;
+
+    NV_ENC_LOCK_INPUT_BUFFER lock = {};
+    lock.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+    lock.inputBuffer = input_buffer_;
+    if (api.fn.nvEncLockInputBuffer(session_.encoder(), &lock) !=
+        NV_ENC_SUCCESS) {
+      RTC_LOG(LS_ERROR) << "NVENC: nvEncLockInputBuffer failed";
+      return false;
+    }
+    auto* dst_y = static_cast<uint8_t*>(lock.bufferDataPtr);
+    uint8_t* dst_uv = dst_y + static_cast<size_t>(height_) * lock.pitch;
+    libyuv::CopyPlane(host->DataY(), host->StrideY(), dst_y,
+                      static_cast<int>(lock.pitch), width_, height_);
+    libyuv::CopyPlane(host->DataUV(), host->StrideUV(), dst_uv,
+                      static_cast<int>(lock.pitch), width_, (height_ + 1) / 2);
+    api.fn.nvEncUnlockInputBuffer(session_.encoder(), input_buffer_);
+    return true;
   }
 
   void SetRates(const RateControlParameters& parameters) override {
@@ -597,6 +660,8 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   NV_ENC_INITIALIZE_PARAMS init_params_ = {};
   NV_ENC_CONFIG config_ = {};
   NV_ENC_OUTPUT_PTR output_buffer_ = nullptr;
+  NV_ENC_INPUT_PTR input_buffer_ = nullptr;
+  bool host_input_ = false;
   std::deque<Registration> registrations_;
 
   webrtc::EncodedImageCallback* callback_ = nullptr;
