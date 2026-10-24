@@ -287,6 +287,12 @@ rtc_shared_library("libwebrtc") {
     "//third_party/libyuv",
   ]
 
+  # Аппаратный H.264 сам симулкаст не умеет: слои раскладывает штатный
+  # адаптер, по энкодеру на слой.
+  if (is_win) {
+    deps += [ "../media:rtc_simulcast_encoder_adapter" ]
+  }
+
   # screen capture device
   if (libwebrtc_desktop_capture) {
     defines += [ "RTC_DESKTOP_DEVICE" ]

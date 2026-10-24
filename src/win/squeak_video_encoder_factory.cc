@@ -19,6 +19,7 @@
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "api/video_codecs/sdp_video_format.h"
 #include "api/video_codecs/video_encoder.h"
+#include "media/engine/simulcast_encoder_adapter.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/synchronization/mutex.h"
 #include "src/win/amf_video_encoder.h"
@@ -47,32 +48,80 @@ std::vector<std::string> CurrentOrder() {
   return Order();
 }
 
-class SqueakVideoEncoderFactory : public webrtc::VideoEncoderFactory {
+bool HardwareSupported(const std::string& name) {
+  if (name == "nvenc") return NvencH264Supported();
+  if (name == "amf") return AmfH264Supported();
+  if (name == "mf") return MediaFoundationH264EncoderSupported();
+  return false;
+}
+
+bool AnyHardware() {
+  for (const std::string& name : CurrentOrder()) {
+    if (HardwareSupported(name)) return true;
+  }
+  return false;
+}
+
+// Энкодер одного слоя: первое живое звено цепочки. nullptr — железа нет, и
+// адаптер возьмёт софт из запасной фабрики.
+class HardwareH264Factory : public webrtc::VideoEncoderFactory {
  public:
-  SqueakVideoEncoderFactory()
-      : builtin_(webrtc::CreateBuiltinVideoEncoderFactory()) {}
+  explicit HardwareH264Factory(const webrtc::VideoEncoderFactory& builtin)
+      : builtin_(builtin) {}
 
   std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
-    return builtin_->GetSupportedFormats();
+    return builtin_.GetSupportedFormats();
   }
 
   std::unique_ptr<webrtc::VideoEncoder> Create(
       const webrtc::Environment& env,
       const webrtc::SdpVideoFormat& format) override {
+    for (const std::string& name : CurrentOrder()) {
+      if (!HardwareSupported(name)) continue;
+      std::unique_ptr<webrtc::VideoEncoder> encoder;
+      if (name == "nvenc") {
+        encoder = CreateNvencH264Encoder(env, format);
+      } else if (name == "amf") {
+        encoder = CreateAmfH264Encoder(env, format);
+      } else if (name == "mf") {
+        encoder = CreateMediaFoundationH264Encoder(env, format);
+      }
+      if (encoder != nullptr) {
+        RTC_LOG(LS_INFO) << "Squeak: H.264 идёт через " << name;
+        return encoder;
+      }
+    }
+    return nullptr;
+  }
+
+ private:
+  const webrtc::VideoEncoderFactory& builtin_;
+};
+
+class SqueakVideoEncoderFactory : public webrtc::VideoEncoderFactory {
+ public:
+  SqueakVideoEncoderFactory()
+      : builtin_(webrtc::CreateBuiltinVideoEncoderFactory()),
+        hardware_(*builtin_) {}
+
+  std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
+    return builtin_->GetSupportedFormats();
+  }
+
+  // Наши энкодеры кодируют один поток: настройки симулкаста они молча
+  // принимали и выдавали верхний слой в полном разрешении под меткой нижнего,
+  // с битрейтом всех слоёв сразу. Слои раскладывает штатный адаптер — по
+  // аппаратному энкодеру на слой, кадр в видеопамяти каждый энкодер ужимает
+  // сам. При одном слое адаптер просто пропускает всё насквозь. Запасная
+  // фабрика — софт: слой, которому не хватило аппаратной сессии, уходит туда,
+  // а не ломает всю демонстрацию.
+  std::unique_ptr<webrtc::VideoEncoder> Create(
+      const webrtc::Environment& env,
+      const webrtc::SdpVideoFormat& format) override {
     if (absl::EqualsIgnoreCase(format.name, "H264")) {
-      for (const std::string& name : CurrentOrder()) {
-        std::unique_ptr<webrtc::VideoEncoder> encoder;
-        if (name == "nvenc" && NvencH264Supported()) {
-          encoder = CreateNvencH264Encoder(env, format);
-        } else if (name == "amf" && AmfH264Supported()) {
-          encoder = CreateAmfH264Encoder(env, format);
-        } else if (name == "mf" && MediaFoundationH264EncoderSupported()) {
-          encoder = CreateMediaFoundationH264Encoder(env, format);
-        }
-        if (encoder != nullptr) {
-          RTC_LOG(LS_INFO) << "Squeak: H.264 идёт через " << name;
-          return encoder;
-        }
+      if (AnyHardware()) {
+        return std::make_unique<webrtc::SimulcastEncoderAdapter>(
+            env, &hardware_, builtin_.get(), format);
       }
       RTC_LOG(LS_INFO) << "Squeak: H.264 идёт софтом";
     }
@@ -87,6 +136,7 @@ class SqueakVideoEncoderFactory : public webrtc::VideoEncoderFactory {
 
  private:
   const std::unique_ptr<webrtc::VideoEncoderFactory> builtin_;
+  HardwareH264Factory hardware_;
 };
 
 }  // namespace
