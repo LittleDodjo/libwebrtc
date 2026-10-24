@@ -5,10 +5,9 @@
 
 #include "modules/audio_processing/include/audio_processing.h"
 #include "rtc_audio_processing.h"
+#include "rtc_custom_processing_adapter.h"
 
 namespace libwebrtc {
-
-class CustomProcessingAdapter;
 
 class RTCAudioProcessingImpl : public RTCAudioProcessing {
  public:
@@ -19,6 +18,8 @@ class RTCAudioProcessingImpl : public RTCAudioProcessing {
 
   void SetRenderPreProcessing(
       RTCAudioProcessing::CustomProcessing* render_pre_processing) override;
+
+  string GetConfigSummary() override;
 
   virtual webrtc::scoped_refptr<webrtc::AudioProcessing> GetAudioProcessing() {
     return apm_;

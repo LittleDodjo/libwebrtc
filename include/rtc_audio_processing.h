@@ -23,11 +23,16 @@ class RTCAudioProcessing : public RefCountInterface {
   };
 
  public:
+  // nullptr отсоединяет процессор; прежнему вызывается Release().
   virtual void SetCapturePostProcessing(
       CustomProcessing* capture_post_processing) = 0;
 
   virtual void SetRenderPreProcessing(
       CustomProcessing* render_pre_processing) = 0;
+
+  // Текущий AudioProcessing::Config одной строкой: что реально включено
+  // после ApplyOptions движка.
+  virtual string GetConfigSummary() = 0;
 };
 
 }  // namespace libwebrtc

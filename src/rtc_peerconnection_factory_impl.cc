@@ -105,6 +105,18 @@ bool RTCPeerConnectionFactoryImpl::Initialize() {
     return false;
   }
 
+#if defined(WEBRTC_WIN)
+  // Init движка в режиме «авто» уже взвёл встроенный AEC Windows (DMO) —
+  // снимаем, пока запись не инициализирована. Источники микрофона просят
+  // программный AEC3 сами (CreateAudioSource), это страховка для путей,
+  // которые инициализируют запись мимо SetSend.
+  worker_thread_->BlockingCall([this] {
+    if (audio_device_module_->BuiltInAECIsAvailable()) {
+      audio_device_module_->EnableBuiltInAEC(false);
+    }
+  });
+#endif
+
   return true;
 }
 
@@ -228,6 +240,17 @@ scoped_refptr<RTCAudioSource> RTCPeerConnectionFactoryImpl::CreateAudioSource(
     rtc_options.auto_gain_control = options.auto_gain_control;
     rtc_options.noise_suppression = options.noise_suppression;
     rtc_options.highpass_filter = options.highpass_filter;
+#if defined(WEBRTC_WIN)
+    // В режиме «авто» движок предпочитает встроенный AEC Windows (DMO), а
+    // тот пишет жёстко 16 кГц моно, с comfort noise и center clipping до
+    // APM. Программные AEC3, AGC и NS работают на частоте устройства.
+    rtc_options.echo_cancellation_mode =
+        webrtc::AudioProcessingMode::kSoftware;
+    rtc_options.auto_gain_control_mode =
+        webrtc::AudioProcessingMode::kSoftware;
+    rtc_options.noise_suppression_mode =
+        webrtc::AudioProcessingMode::kSoftware;
+#endif
   }
   webrtc::scoped_refptr<libwebrtc::LocalAudioSource> rtc_source_track =
       CreateAudioSourceWithOptions(
