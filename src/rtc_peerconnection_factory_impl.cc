@@ -106,18 +106,32 @@ bool RTCPeerConnectionFactoryImpl::Initialize() {
   }
 
 #if defined(WEBRTC_WIN)
-  // Init движка в режиме «авто» уже взвёл встроенный AEC Windows (DMO) —
-  // снимаем, пока запись не инициализирована. Источники микрофона просят
-  // программный AEC3 сами (CreateAudioSource), это страховка для путей,
-  // которые инициализируют запись мимо SetSend.
-  worker_thread_->BlockingCall([this] {
-    if (audio_device_module_->BuiltInAECIsAvailable()) {
-      audio_device_module_->EnableBuiltInAEC(false);
-    }
-  });
+  // Здесь ADM ещё не инициализирован (движок поднимается при первом
+  // PeerConnection), так что это срабатывает только если его инициализировали
+  // заранее; основной вызов — в Create().
+  worker_thread_->BlockingCall([this] { DisableBuiltInAec_w(); });
 #endif
 
   return true;
+}
+
+void RTCPeerConnectionFactoryImpl::DisableBuiltInAec_w() {
+#if defined(WEBRTC_WIN)
+  // Встроенный AEC Windows (DMO) пишет жёстко 16 кГц моно и включается
+  // опциями по умолчанию в WebRtcVoiceEngine::Init(). В m144 этот Init
+  // ленивый: ConnectionContext считает ссылки на движок и зовёт его при первом
+  // PeerConnection, а не при создании фабрики. Опции источника (kSoftware) до
+  // канала доезжают после SetSend, а в уже соединённый транспорт (LiveKit
+  // публикует микрофон в готовый PeerConnection) SetSend с InitRecording
+  // уходит раньше них — и запись стартует в DMO. Снимаем DMO после создания
+  // каждого PeerConnection: движок уже инициализирован, запись ещё нет.
+  // До инициализации ADM оба запроса ниже отвечают false — вызов пустой.
+  if (!audio_device_module_ || audio_device_module_->RecordingIsInitialized() ||
+      !audio_device_module_->BuiltInAECIsAvailable()) {
+    return;
+  }
+  audio_device_module_->EnableBuiltInAEC(false);
+#endif
 }
 
 bool RTCPeerConnectionFactoryImpl::Terminate() {
@@ -154,6 +168,10 @@ scoped_refptr<RTCPeerConnection> RTCPeerConnectionFactoryImpl::Create(
           new RefCountedObject<RTCPeerConnectionImpl>(
               configuration, constraints, rtc_peerconnection_factory_));
   peerconnections_.push_back(peerconnection);
+#if defined(WEBRTC_WIN)
+  // Первый PeerConnection только что инициализировал движок и взвёл DMO.
+  worker_thread_->BlockingCall([this] { DisableBuiltInAec_w(); });
+#endif
   return peerconnection;
 }
 

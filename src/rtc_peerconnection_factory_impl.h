@@ -92,6 +92,9 @@ class RTCPeerConnectionFactoryImpl : public RTCPeerConnectionFactory {
 
   void DestroyAudioDeviceModule_w();
 
+  // Windows: снять встроенный AEC (DMO), пока запись не инициализирована.
+  void DisableBuiltInAec_w();
+
   webrtc::scoped_refptr<libwebrtc::LocalAudioSource>
   CreateAudioSourceWithOptions(webrtc::AudioOptions* options,
                                bool is_custom_source = false);
