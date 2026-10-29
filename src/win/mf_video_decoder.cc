@@ -7,6 +7,7 @@
 
 #include "src/win/mf_video_decoder.h"
 
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -17,18 +18,24 @@
 #include "common_video/include/video_frame_buffer_pool.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/numerics/sequence_number_unwrapper.h"
 #include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
 
 #if defined(WEBRTC_WIN)
 
+// Порядок значим: windows.h идёт первым; интерфейс ICodecAPI объявлен в
+// MIDL-заголовке icodecapi.h, в codecapi.h — только CODECAPI_*-гуиды.
+#include <windows.h>
+
+#include <codecapi.h>
 #include <d3d11.h>
+#include <icodecapi.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
 #include <mftransform.h>
 #include <wmcodecdsp.h>
-#include <windows.h>
 #include <wrl/client.h>
 
 #include "src/win/d3d11_frame_buffer.h"
@@ -112,6 +119,16 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
     width_ = resolution.Valid() ? resolution.Width() : 1920;
     height_ = resolution.Valid() ? resolution.Height() : 1080;
 
+    pending_.clear();
+    last_sample_time_ = -1;
+    frames_in_ = 0;
+    frames_out_ = 0;
+    swallowed_ = 0;
+    batches_ = 0;
+    max_batch_ = 0;
+    fifo_logged_ = false;
+    EnableLowLatency();
+
     if (!SetInputType() || !SetOutputType()) {
       Release();
       return false;
@@ -119,7 +136,9 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
 
     transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-    RTC_LOG(LS_INFO) << "MF: H.264-декодер поднят " << width_ << "x" << height_;
+    RTC_LOG(LS_INFO) << "MF: H.264-декодер поднят " << width_ << "x" << height_
+                     << ", низкая задержка "
+                     << (low_latency_ ? "включена" : "недоступна");
     return true;
   }
 
@@ -130,15 +149,42 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
     if (input.size() == 0) return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
 
     ComPtr<IMFSample> sample;
-    if (!WrapEncodedImage(input, &sample)) return WEBRTC_VIDEO_CODEC_ERROR;
+    LONGLONG sample_time = 0;
+    if (!WrapEncodedImage(input, &sample, &sample_time)) {
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
 
-    const HRESULT hr = transform_->ProcessInput(0, sample.Get(), 0);
+    HRESULT hr = transform_->ProcessInput(0, sample.Get(), 0);
+    if (hr == MF_E_NOTACCEPTING) {
+      // Вход не принят, пока не забран выход: забираем и подаём снова.
+      DrainOutput();
+      hr = transform_->ProcessInput(0, sample.Get(), 0);
+    }
     if (FAILED(hr)) {
       RTC_LOG(LS_WARNING) << "MF: ProcessInput hr=" << hr;
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
 
-    DrainOutput(input);
+    // Кадр ждёт своего выхода. Переполнение очереди значит, что декодер молча
+    // съел кадры — старые забываем, иначе метки сопоставятся не тем кадрам.
+    pending_.push_back(
+        PendingInput{sample_time, input.RtpTimestamp(), input.ntp_time_ms_});
+    while (pending_.size() > kMaxPending) {
+      pending_.pop_front();
+      ++swallowed_;
+    }
+    ++frames_in_;
+
+    DrainOutput();
+
+    // Раз в ~10 с при 60 к/с — сводка для лога устройства: сколько вошло,
+    // сколько вышло, сколько декодер проглотил и отдавал ли пачками.
+    if (frames_in_ % 600 == 0) {
+      RTC_LOG(LS_INFO) << "MF: вход " << frames_in_ << ", выход "
+                       << frames_out_ << ", проглочено " << swallowed_
+                       << ", пачек " << batches_ << " (до " << max_batch_
+                       << " кадров), ожидает " << pending_.size();
+    }
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
@@ -154,6 +200,8 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
       transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
       transform_.Reset();
     }
+    pending_.clear();
+    last_sample_time_ = -1;
     device_manager_.Reset();
     device_.Reset();
     gpu_ = nullptr;
@@ -168,6 +216,77 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
   }
 
  private:
+  // Поданный на вход кадр: по метке времени сэмпла узнаём его на выходе и
+  // возвращаем WebRTC его же rtp-метку, а не метку текущего входа.
+  struct PendingInput {
+    LONGLONG sample_time;
+    uint32_t rtp_timestamp;
+    int64_t ntp_time_ms;
+  };
+
+  // Режим низкой задержки: кадр на входе — кадр на выходе, без накопления под
+  // переупорядочивание. Без него декодер Microsoft отдаёт кадры «когда получит
+  // достаточно входных сэмплов» — с опозданием и пачками, а WebRTC считает
+  // опоздавшие кадры выброшенными декодером (29.10: 1 кадр из 4 на любом слое).
+  void EnableLowLatency() {
+    low_latency_ = false;
+    ComPtr<IMFAttributes> attributes;
+    if (SUCCEEDED(transform_->GetAttributes(&attributes)) &&
+        attributes != nullptr &&
+        SUCCEEDED(attributes->SetUINT32(MF_LOW_LATENCY, TRUE))) {
+      low_latency_ = true;
+    }
+    ComPtr<ICodecAPI> codec_api;
+    if (SUCCEEDED(transform_.As(&codec_api)) && codec_api != nullptr) {
+      // У декодера H.264 Microsoft это свойство типа VT_UI4, у остальных —
+      // VT_BOOL; пробуем оба.
+      VARIANT value = {};
+      value.vt = VT_UI4;
+      value.ulVal = 1;
+      HRESULT hr = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &value);
+      if (FAILED(hr)) {
+        value.vt = VT_BOOL;
+        value.boolVal = VARIANT_TRUE;
+        hr = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &value);
+      }
+      if (SUCCEEDED(hr)) {
+        low_latency_ = true;
+      } else {
+        RTC_LOG(LS_WARNING) << "MF: CODECAPI_AVLowLatencyMode hr=" << hr;
+      }
+    }
+  }
+
+  // Чей кадр вышел: по метке времени выходного сэмпла — декодер возвращает ту,
+  // что была на входе. Ожидавшие раньше найденного декодер проглотил, их уже
+  // не будет. Нет совпадения — берём самый старый из ожидающих: без
+  // переупорядочивания кадры выходят в порядке входа.
+  PendingInput MatchOutput(IMFSample* sample) {
+    LONGLONG time = -1;
+    if (SUCCEEDED(sample->GetSampleTime(&time))) {
+      for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+        if (it->sample_time != time) continue;
+        const PendingInput meta = *it;
+        swallowed_ += static_cast<int64_t>(it - pending_.begin());
+        pending_.erase(pending_.begin(), it + 1);
+        return meta;
+      }
+    }
+    if (!pending_.empty()) {
+      if (!fifo_logged_) {
+        fifo_logged_ = true;
+        RTC_LOG(LS_INFO) << "MF: метка выходного сэмпла " << time
+                         << " не совпала со входом — кадры считаем по порядку";
+      }
+      const PendingInput meta = pending_.front();
+      pending_.pop_front();
+      return meta;
+    }
+    // Ожидающих нет — декодер отдал больше, чем получил. Метка нулевая: WebRTC
+    // такой кадр отбросит как лишний, а не припишет его другому.
+    return PendingInput{time, 0, 0};
+  }
+
   bool CreateDevice() {
     // Декодируем на общем устройстве процесса: тогда распакованный кадр остаётся
     // текстурой, и рендер берёт его без чтения в память. Устройство уже
@@ -221,6 +340,9 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
     type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
     type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     ::MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width_, height_);
+    // Частота — подсказка декодеру (документация MS: чем полнее входной тип,
+    // тем меньше смен формата на старте); настоящий ритм задают метки сэмплов.
+    ::MFSetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, 60, 1);
     const HRESULT hr = transform_->SetInputType(0, type.Get(), 0);
     if (FAILED(hr)) RTC_LOG(LS_WARNING) << "MF: SetInputType hr=" << hr;
     return SUCCEEDED(hr);
@@ -315,7 +437,7 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
   }
 
   bool WrapEncodedImage(const webrtc::EncodedImage& input,
-                        ComPtr<IMFSample>* out) {
+                        ComPtr<IMFSample>* out, LONGLONG* sample_time) {
     ComPtr<IMFSample> sample;
     if (FAILED(::MFCreateSample(&sample))) return false;
 
@@ -333,36 +455,57 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
     buffer->SetCurrentLength(static_cast<DWORD>(input.size()));
 
     sample->AddBuffer(buffer.Get());
-    // MF считает время в 100-наносекундных единицах.
-    sample->SetSampleTime(static_cast<LONGLONG>(input.RtpTimestamp()) * 10);
+    // MF считает время в 100-нс единицах, rtp идёт на 90 кГц: 10^7 / 90000 =
+    // 1000/9. Раньше тут было rtp×10 — в 111 раз чаще реального времени.
+    // Метка развёрнута в 64 бита, чтобы росла монотонно и через переход rtp
+    // через ноль; по ней же узнаём свой кадр на выходе.
+    const int64_t unwrapped = unwrapper_.Unwrap(input.RtpTimestamp());
+    const LONGLONG time = static_cast<LONGLONG>(unwrapped * 1000 / 9);
+    sample->SetSampleTime(time);
+    const LONGLONG step = time - last_sample_time_;
+    sample->SetSampleDuration(
+        last_sample_time_ >= 0 && step > 0 && step < 10000000 ? step : 166667);
+    last_sample_time_ = time;
     if (input.FrameType() == webrtc::VideoFrameType::kVideoFrameKey) {
       sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
     }
     *out = sample;
+    *sample_time = time;
     return true;
   }
 
-  void DrainOutput(const webrtc::EncodedImage& input) {
+  // Забираем всё, что декодер готов отдать. Каждый кадр подписывается меткой
+  // своего входа (MatchOutput), поэтому пачка из нескольких кадров доходит до
+  // WebRTC целиком, а не одним кадром с тремя «выброшенными».
+  void DrainOutput() {
+    int batch = 0;
     while (true) {
       MFT_OUTPUT_DATA_BUFFER output = {};
       DWORD status = 0;
       const HRESULT hr = transform_->ProcessOutput(0, 1, &output, &status);
 
-      if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return;
+      if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) break;
       if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-        if (!SetOutputType()) return;
+        if (!SetOutputType()) break;
         continue;
       }
       if (FAILED(hr)) {
         RTC_LOG(LS_WARNING) << "MF: ProcessOutput hr=" << hr;
-        return;
+        break;
       }
 
       if (output.pSample != nullptr) {
-        EmitFrame(output.pSample, input);
+        const PendingInput meta = MatchOutput(output.pSample);
+        EmitFrame(output.pSample, meta);
         output.pSample->Release();
+        ++frames_out_;
+        ++batch;
       }
       if (output.pEvents != nullptr) output.pEvents->Release();
+    }
+    if (batch > 1) {
+      ++batches_;
+      if (batch > max_batch_) max_batch_ = batch;
     }
   }
 
@@ -374,8 +517,8 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
   // Возвращает false, если буфер не в видеопамяти (тогда нативного пути нет
   // вовсе). *busy = true — путь есть, но пул текстур сейчас занят: считать это
   // отказом нельзя, иначе несколько потоков разом выбьют декодер на процессор.
-  bool EmitNativeFrame(IMFMediaBuffer* buffer,
-                       const webrtc::EncodedImage& input, bool* busy) {
+  bool EmitNativeFrame(IMFMediaBuffer* buffer, const PendingInput& meta,
+                       bool* busy) {
     *busy = false;
     if (gpu_ == nullptr) return false;
     ComPtr<IMFDXGIBuffer> dxgi;
@@ -407,7 +550,8 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
 
     webrtc::VideoFrame out = webrtc::VideoFrame::Builder()
                                  .set_video_frame_buffer(frame)
-                                 .set_rtp_timestamp(input.RtpTimestamp())
+                                 .set_rtp_timestamp(meta.rtp_timestamp)
+                                 .set_ntp_time_ms(meta.ntp_time_ms)
                                  .set_timestamp_us(webrtc::TimeMicros())
                                  .build();
     callback_->Decoded(out);
@@ -415,7 +559,7 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
     return true;
   }
 
-  void EmitFrame(IMFSample* sample, const webrtc::EncodedImage& input) {
+  void EmitFrame(IMFSample* sample, const PendingInput& meta) {
     if (width_ <= 0 || height_ <= 0) return;
     if (aligned_height_ < height_ || aligned_width_ < width_) return;
 
@@ -424,7 +568,7 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
 
     if (native_failures_ < kMaxNativeFailures) {
       bool busy = false;
-      if (EmitNativeFrame(buffer.Get(), input, &busy)) return;
+      if (EmitNativeFrame(buffer.Get(), meta, &busy)) return;
       // Занятый пул — временное; кадр пойдёт через память, следующий снова
       // попробует видеопамять. Буфер не DXGI полсекунды подряд — нативного
       // пути здесь нет, больше не пробуем.
@@ -527,7 +671,8 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
 
     webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
                                    .set_video_frame_buffer(i420)
-                                   .set_rtp_timestamp(input.RtpTimestamp())
+                                   .set_rtp_timestamp(meta.rtp_timestamp)
+                                   .set_ntp_time_ms(meta.ntp_time_ms)
                                    .set_timestamp_us(webrtc::TimeMicros())
                                    .build();
     callback_->Decoded(frame);
@@ -540,6 +685,20 @@ class MediaFoundationH264Decoder : public webrtc::VideoDecoder {
   static constexpr int kMaxNativeFailures = 30;
   int native_failures_ = 0;
   webrtc::VideoFrameBufferPool pool_;
+
+  // Входы, ещё не вышедшие из декодера, по порядку подачи. Глубже
+  // kMaxPending декодер честный поток не держит: это уже проглоченные кадры.
+  static constexpr size_t kMaxPending = 32;
+  std::deque<PendingInput> pending_;
+  webrtc::RtpTimestampUnwrapper unwrapper_;
+  LONGLONG last_sample_time_ = -1;
+  bool low_latency_ = false;
+  bool fifo_logged_ = false;
+  int64_t frames_in_ = 0;
+  int64_t frames_out_ = 0;
+  int64_t swallowed_ = 0;
+  int64_t batches_ = 0;
+  int max_batch_ = 0;
 
   webrtc::DecodedImageCallback* callback_ = nullptr;
   // Видимая часть кадра.

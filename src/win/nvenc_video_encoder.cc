@@ -474,6 +474,10 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     h264.h264VUIParameters.transferCharacteristics =
         NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
     h264.h264VUIParameters.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+    // bitstream_restriction в VUI: декодеру сказано, что переупорядочивания
+    // нет (B-кадров нет), и держать кадры под худший случай DPB незачем.
+    // Без этого декодер Microsoft на приёме копил кадры (29.10, SQC-258).
+    h264.h264VUIParameters.bitstreamRestrictionFlag = 1;
 
     init_params_ = {};
     init_params_.version = NV_ENC_INITIALIZE_PARAMS_VER;
