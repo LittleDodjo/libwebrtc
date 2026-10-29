@@ -149,11 +149,17 @@ bool RTCPeerConnectionFactoryImpl::Terminate() {
 }
 
 void RTCPeerConnectionFactoryImpl::CreateAudioDeviceModule_w() {
-  if (!audio_device_module_)
-    audio_device_module_ = webrtc::CreateAudioDeviceModule(
-        env_,
-        webrtc::AudioDeviceModule::kPlatformDefaultAudio,
-        false);
+  if (audio_device_module_) return;
+  audio_device_module_ = webrtc::CreateAudioDeviceModule(
+      env_, webrtc::AudioDeviceModule::kPlatformDefaultAudio, false);
+  // Поднимаем ADM сразу, как апстрим libwebrtc (8586c07): иначе до первого
+  // PeerConnection список устройств пуст, а выбор отвечает «не найдено»
+  // (SQC-268, SQC-276). Init() идемпотентен, голосовой движок потом зовёт
+  // его вхолостую; после закрытия последнего PeerConnection движок снимает
+  // ADM, и его заново поднимает AudioDeviceImpl при следующем обращении.
+  if (audio_device_module_ && audio_device_module_->Init() != 0) {
+    RTC_LOG(LS_WARNING) << "ADM: Init() при создании фабрики не удался";
+  }
 }
 
 void RTCPeerConnectionFactoryImpl::DestroyAudioDeviceModule_w() {

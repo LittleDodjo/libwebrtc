@@ -15,19 +15,33 @@ AudioDeviceImpl::~AudioDeviceImpl() {
   RTC_LOG(LS_INFO) << __FUNCTION__ << ": dtor ";
 }
 
+void AudioDeviceImpl::EnsureInitialized_w() {
+  RTC_DCHECK_RUN_ON(worker_thread_);
+  if (audio_device_module_->Initialized()) return;
+  if (audio_device_module_->Init() != 0) {
+    RTC_LOG(LS_WARNING) << "ADM: Init() не удался, устройств не будет";
+  }
+}
+
 int16_t AudioDeviceImpl::PlayoutDevices() {
-  return audio_device_module_->PlayoutDevices();
+  return worker_thread_->BlockingCall([&] {
+    EnsureInitialized_w();
+    return audio_device_module_->PlayoutDevices();
+  });
 }
 
 int16_t AudioDeviceImpl::RecordingDevices() {
-  return audio_device_module_->RecordingDevices();
+  return worker_thread_->BlockingCall([&] {
+    EnsureInitialized_w();
+    return audio_device_module_->RecordingDevices();
+  });
 }
 
 int32_t AudioDeviceImpl::PlayoutDeviceName(uint16_t index,
                                            char name[kAdmMaxDeviceNameSize],
                                            char guid[kAdmMaxGuidSize]) {
   return worker_thread_->BlockingCall([&] {
-    RTC_DCHECK_RUN_ON(worker_thread_);
+    EnsureInitialized_w();
     return audio_device_module_->PlayoutDeviceName(index, name, guid);
   });
 }
@@ -36,14 +50,14 @@ int32_t AudioDeviceImpl::RecordingDeviceName(uint16_t index,
                                              char name[kAdmMaxDeviceNameSize],
                                              char guid[kAdmMaxGuidSize]) {
   return worker_thread_->BlockingCall([&] {
-    RTC_DCHECK_RUN_ON(worker_thread_);
+    EnsureInitialized_w();
     return audio_device_module_->RecordingDeviceName(index, name, guid);
   });
 }
 
 int32_t AudioDeviceImpl::SetPlayoutDevice(uint16_t index) {
   worker_thread_->PostTask([this, index] {
-    RTC_DCHECK_RUN_ON(worker_thread_);
+    EnsureInitialized_w();
     if (audio_device_module_->Playing()) {
       audio_device_module_->StopPlayout();
       audio_device_module_->SetPlayoutDevice(index);
@@ -58,7 +72,7 @@ int32_t AudioDeviceImpl::SetPlayoutDevice(uint16_t index) {
 
 int32_t AudioDeviceImpl::SetRecordingDevice(uint16_t index) {
   worker_thread_->PostTask([this, index] {
-    RTC_DCHECK_RUN_ON(worker_thread_);
+    EnsureInitialized_w();
     if (audio_device_module_->Recording()) {
       audio_device_module_->StopRecording();
       audio_device_module_->SetRecordingDevice(index);

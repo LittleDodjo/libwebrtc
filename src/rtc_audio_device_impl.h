@@ -45,6 +45,12 @@ class AudioDeviceImpl : public RTCAudioDevice, public webrtc::AudioDeviceObserve
   void OnDevicesUpdated() override;
 
  private:
+  // ADM в m144 поднимает голосовой движок при первом PeerConnection и снимает
+  // при закрытии последнего; вне звонка перечисление отвечает −1, а выбор
+  // устройства — «не найдено» (SQC-268, SQC-276). Поднимаем сами: Init()
+  // идемпотентен, движок потом зовёт его вхолостую. Только на worker-потоке.
+  void EnsureInitialized_w();
+
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> audio_device_module_;
   webrtc::Thread* worker_thread_ = nullptr;
   OnDeviceChangeCallback listener_ = nullptr;
