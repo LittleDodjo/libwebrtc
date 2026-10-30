@@ -146,6 +146,11 @@ args="is_debug=$debug  \
   use_rtti=true \
   rtc_use_x11=true"
 
+# Кэш компиляции в CI: SQUEAK_CC_WRAPPER=sccache задаёт workflow.
+if [ -n "${SQUEAK_CC_WRAPPER:-}" ]; then
+  args="$args cc_wrapper=\"$SQUEAK_CC_WRAPPER\""
+fi
+
 # generate ninja files
 gn gen "$OUTPUT_DIR" --root="src" --args="${args}"
 

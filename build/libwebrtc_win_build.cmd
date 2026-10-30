@@ -107,9 +107,13 @@ if "!profile!" == "debug" (
   set "debug=true"
 )
 
+rem Кэш компиляции в CI: SQUEAK_CC_WRAPPER=sccache задаёт workflow.
+set "wrapper_arg="
+if not "%SQUEAK_CC_WRAPPER%" == "" set "wrapper_arg= cc_wrapper=\"%SQUEAK_CC_WRAPPER%\""
+
 rem generate ninja for release
 call gn.bat gen %OUTPUT_DIR% --root="src" ^
-  --args="is_debug=!debug! is_clang=true target_cpu=\"!arch!\" use_custom_libcxx=false rtc_libvpx_build_vp9=true enable_libaom=true rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false is_component_build=false rtc_enable_protobuf=false rtc_use_h264=true ffmpeg_branding=\"Chrome\" symbol_level=0 enable_iterator_debugging=false"
+  --args="is_debug=!debug! is_clang=true target_cpu=\"!arch!\" use_custom_libcxx=false rtc_libvpx_build_vp9=true enable_libaom=true rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false is_component_build=false rtc_enable_protobuf=false rtc_use_h264=true ffmpeg_branding=\"Chrome\" symbol_level=0 enable_iterator_debugging=false!wrapper_arg!"
 
 rem build
 ninja.exe -C %OUTPUT_DIR% libwebrtc

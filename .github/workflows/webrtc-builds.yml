@@ -42,11 +42,23 @@ on:
         description: 'Only x64 (skip arm64) — проверочные прогоны короче на ~20 минут'
         type: boolean
         default: true
+      sccache:
+        description: 'Кэш компиляции (sccache): при мелкой правке пересобираются только изменённые файлы'
+        type: boolean
+        default: true
 
 permissions:
   packages: write
   contents: write
   actions: read
+
+# Кэш компиляции: раннер каждый раз чистый, и без него 4275 файлов движка
+# компилировались с нуля даже ради правки в трёх строках (~24 мин на
+# Windows). sccache хранит объектники в кэше Actions; GN подставляет его
+# через cc_wrapper (тулчейн Chromium поддерживает это и для clang-cl).
+env:
+  SCCACHE_GHA_ENABLED: ${{ (github.event_name != 'workflow_dispatch' || inputs.sccache) && 'true' || 'false' }}
+  SQUEAK_CC_WRAPPER: ${{ (github.event_name != 'workflow_dispatch' || inputs.sccache) && 'sccache' || '' }}
 
 jobs:
   build-linux:
@@ -92,9 +104,17 @@ jobs:
           docker-images: true
           swap-storage: true
 
+      - name: Compile cache (sccache)
+        if: env.SQUEAK_CC_WRAPPER != ''
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+
       - name: Build WebRTC
         run: chmod +x ./libwebrtc_linux_build.sh && ./libwebrtc_linux_build.sh --arch ${{ matrix.arch }} --profile ${{ matrix.profile }} --commit "${{ github.event.inputs.commitHash }}"
         working-directory: build
+
+      - name: Compile cache stats
+        if: env.SQUEAK_CC_WRAPPER != '' && always()
+        run: sccache --show-stats || true
 
       - name: Zip artifact (Unix)
         run: |
@@ -141,9 +161,18 @@ jobs:
         shell: bash
         working-directory: build
 
+      - name: Compile cache (sccache)
+        if: env.SQUEAK_CC_WRAPPER != ''
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+
       - name: Build WebRTC
         run: .\libwebrtc_win_build.cmd --arch ${{ matrix.arch }} --profile ${{ matrix.profile }} --commit "${{ github.event.inputs.commitHash }}"
         working-directory: build
+
+      - name: Compile cache stats
+        if: env.SQUEAK_CC_WRAPPER != '' && always()
+        shell: bash
+        run: sccache --show-stats || true
 
       - name: Zip artifact (Windows)
         run: Compress-Archive -Path .\build\libwebrtc-${{ matrix.arch }}-${{ matrix.profile }} -DestinationPath .\build\libwebrtc-win-${{ matrix.arch }}-${{ matrix.profile }}.zip
