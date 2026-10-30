@@ -76,7 +76,9 @@ call git checkout -f "!checkout_ref!"
 call git clean -df
 popd
 
-call gclient.bat sync --with_branch_heads --jobs=8
+rem Без истории зависимостей: раннер каждый раз чистый, история не нужна,
+rem а src/third_party с полной историей качался ~16 минут из 21.
+call gclient.bat sync --no-history --jobs=16
 
 
 if not exist src/libwebrtc (

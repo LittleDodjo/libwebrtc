@@ -92,7 +92,9 @@ run_gclient_sync() {
     git clean -df
   )
 
-  gclient sync --with_branch_heads --jobs=8
+  # Без истории зависимостей: раннер каждый раз чистый, история не нужна,
+  # а на Windows src/third_party с полной историей качался ~16 минут.
+  gclient sync --no-history --jobs=16
 }
 
 run_gclient_sync

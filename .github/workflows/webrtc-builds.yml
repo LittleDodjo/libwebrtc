@@ -59,6 +59,10 @@ permissions:
 env:
   SCCACHE_GHA_ENABLED: ${{ (github.event_name != 'workflow_dispatch' || inputs.sccache) && 'true' || 'false' }}
   SQUEAK_CC_WRAPPER: ${{ (github.event_name != 'workflow_dispatch' || inputs.sccache) && 'sccache' || '' }}
+  # Журнал сервера sccache: в первом прогоне не записались 18–34% объектников,
+  # причину печатает шаг «Compile cache stats».
+  SCCACHE_LOG: sccache::server=debug,sccache::compiler=debug
+  SCCACHE_ERROR_LOG: ${{ github.workspace }}/sccache-server.log
 
 jobs:
   build-linux:
@@ -114,7 +118,16 @@ jobs:
 
       - name: Compile cache stats
         if: env.SQUEAK_CC_WRAPPER != '' && always()
-        run: sccache --show-stats || true
+        run: |
+          sccache --show-stats || true
+          log="$SCCACHE_ERROR_LOG"
+          if command -v cygpath >/dev/null; then log=$(cygpath -u "$log"); fi
+          if [ -f "$log" ]; then
+            echo "Журнал сервера: $(wc -l < "$log") строк. Ошибки записи, по видам:"
+            grep -iE "cache write|write error|rate.?limit|too many|429" "$log" |
+              sed -E 's/^\[[^]]*\] *//; s/\[[^]]*\]: //; s/[0-9a-f]{16,}/…/g' | cut -c1-240 |
+              sort | uniq -c | sort -rn | head -15 || true
+          fi
 
       - name: Zip artifact (Unix)
         run: |
@@ -172,7 +185,16 @@ jobs:
       - name: Compile cache stats
         if: env.SQUEAK_CC_WRAPPER != '' && always()
         shell: bash
-        run: sccache --show-stats || true
+        run: |
+          sccache --show-stats || true
+          log="$SCCACHE_ERROR_LOG"
+          if command -v cygpath >/dev/null; then log=$(cygpath -u "$log"); fi
+          if [ -f "$log" ]; then
+            echo "Журнал сервера: $(wc -l < "$log") строк. Ошибки записи, по видам:"
+            grep -iE "cache write|write error|rate.?limit|too many|429" "$log" |
+              sed -E 's/^\[[^]]*\] *//; s/\[[^]]*\]: //; s/[0-9a-f]{16,}/…/g' | cut -c1-240 |
+              sort | uniq -c | sort -rn | head -15 || true
+          fi
 
       - name: Zip artifact (Windows)
         run: Compress-Archive -Path .\build\libwebrtc-${{ matrix.arch }}-${{ matrix.profile }} -DestinationPath .\build\libwebrtc-win-${{ matrix.arch }}-${{ matrix.profile }}.zip
