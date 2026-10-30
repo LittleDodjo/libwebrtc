@@ -349,7 +349,9 @@ class AmfH264Encoder : public webrtc::VideoEncoder {
     info.is_hardware_accelerated = true;
     info.supports_native_handle = true;
     info.preferred_pixel_formats = {webrtc::VideoFrameBuffer::Type::kNV12};
-    info.has_trusted_rate_controller = false;
+    // CBR с ENFORCE_HRD и без пропуска кадров держит битрейт сам; иначе
+    // WebRTC выкидывает кадры после каждого опорного (см. NVENC, SQC-258).
+    info.has_trusted_rate_controller = true;
     info.requested_resolution_alignment = 2;
     info.apply_alignment_to_all_simulcast_layers = true;
     info.scaling_settings = webrtc::VideoEncoder::ScalingSettings(kLowQp, kHighQp);

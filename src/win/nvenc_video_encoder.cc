@@ -405,7 +405,12 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     // ровно то, что отдаёт захват, без лишнего перекладывания плоскостей.
     info.supports_native_handle = true;
     info.preferred_pixel_formats = {webrtc::VideoFrameBuffer::Type::kNV12};
-    info.has_trusted_rate_controller = false;
+    // CBR с VBV в один кадр держит битрейт сам. Недоверенному энкодеру
+    // WebRTC включает свой выброс кадров (MediaOptimization), и для H.264 без
+    // временных слоёв он не выключается даже на демонстрации: после каждого
+    // крупного опорного кадра выкидывались следующие — картинка дёргалась
+    // (SQC-258).
+    info.has_trusted_rate_controller = true;
     info.requested_resolution_alignment = 2;
     info.apply_alignment_to_all_simulcast_layers = true;
     info.scaling_settings = webrtc::VideoEncoder::ScalingSettings(kLowQp, kHighQp);
@@ -538,12 +543,15 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     config->rcParams.zeroReorderDelay = 1;
     config->rcParams.enableNonRefP = 0;
     // VBV в один кадр — это и есть low latency: энкодеру нечем «занять»
-    // будущие кадры, поэтому он не копит задержку. Ключевой кадр при этом
-    // может быть втрое крупнее P-кадра: его ждут новые зрители и восстановление
-    // после потерь, и мыльный IDR там хуже короткого всплеска.
+    // будущие кадры, поэтому он не копит задержку. На демонстрации ключевой
+    // кадр не крупнее обычного: он грубее (кубики на полсекунды, следующие
+    // кадры дорисовывают), зато нет всплеска, после которого кадры
+    // задерживаются в пейсере, — частота держится (SQC-258). У камеры —
+    // втрое крупнее: там мыльный IDR заметнее короткого всплеска.
     config->rcParams.vbvBufferSize = average / fps;
     config->rcParams.vbvInitialDelay = config->rcParams.vbvBufferSize;
-    config->rcParams.lowDelayKeyFrameScale = 3;
+    config->rcParams.lowDelayKeyFrameScale =
+        mode_ == webrtc::VideoCodecMode::kScreensharing ? 1 : 3;
   }
 
   bool Reconfigure() {
