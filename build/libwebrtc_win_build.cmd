@@ -79,6 +79,11 @@ popd
 rem Без истории зависимостей: раннер каждый раз чистый, история не нужна,
 rem а src/third_party с полной историей качался ~16 минут из 21.
 call gclient.bat sync --no-history --jobs=16
+rem Без истории в src/build нет коммита с Change-Id: lastchange.py пишет версию
+rem 0.0.0, метка времени линковки выходит отрицательной, и lld-link падает.
+rem Версия по верхнему коммиту src/build — своя метка, но настоящая.
+call python3 src\build\util\lastchange.py --filter=. -o src\build\util\LASTCHANGE
+if errorlevel 1 exit /b 1
 
 
 if not exist src/libwebrtc (

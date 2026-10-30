@@ -123,10 +123,10 @@ jobs:
           log="$SCCACHE_ERROR_LOG"
           if command -v cygpath >/dev/null; then log=$(cygpath -u "$log"); fi
           if [ -f "$log" ]; then
-            echo "Журнал сервера: $(wc -l < "$log") строк. Ошибки записи, по видам:"
-            grep -iE "cache write|write error|rate.?limit|too many|429" "$log" |
-              sed -E 's/^\[[^]]*\] *//; s/\[[^]]*\]: //; s/[0-9a-f]{16,}/…/g' | cut -c1-240 |
-              sort | uniq -c | sort -rn | head -15 || true
+            echo "Ошибки записи в кэш, по видам:"
+            grep -a "Error executing cache write" "$log" |
+              sed -E 's/\x1b\[[0-9;]*m//g; s/.*Error executing cache write: //; s/, context:.*//' |
+              sort | uniq -c | sort -rn | head -10 || true
           fi
 
       - name: Zip artifact (Unix)
@@ -190,10 +190,10 @@ jobs:
           log="$SCCACHE_ERROR_LOG"
           if command -v cygpath >/dev/null; then log=$(cygpath -u "$log"); fi
           if [ -f "$log" ]; then
-            echo "Журнал сервера: $(wc -l < "$log") строк. Ошибки записи, по видам:"
-            grep -iE "cache write|write error|rate.?limit|too many|429" "$log" |
-              sed -E 's/^\[[^]]*\] *//; s/\[[^]]*\]: //; s/[0-9a-f]{16,}/…/g' | cut -c1-240 |
-              sort | uniq -c | sort -rn | head -15 || true
+            echo "Ошибки записи в кэш, по видам:"
+            grep -a "Error executing cache write" "$log" |
+              sed -E 's/\x1b\[[0-9;]*m//g; s/.*Error executing cache write: //; s/, context:.*//' |
+              sort | uniq -c | sort -rn | head -10 || true
           fi
 
       - name: Zip artifact (Windows)
