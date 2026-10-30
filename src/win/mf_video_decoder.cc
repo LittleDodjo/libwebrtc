@@ -24,13 +24,13 @@
 
 #if defined(WEBRTC_WIN)
 
-// Порядок значим: windows.h идёт первым; интерфейс ICodecAPI объявлен в
-// MIDL-заголовке icodecapi.h, в codecapi.h — только CODECAPI_*-гуиды.
+// Порядок значим: windows.h идёт первым. ICodecAPI приходит из strmif.h
+// через wmcodecdsp.h; icodecapi.h рядом с ним не включать — оба объявляют
+// CodecAPIEventData, и сборка падает на повторном определении.
 #include <windows.h>
 
 #include <codecapi.h>
 #include <d3d11.h>
-#include <icodecapi.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
