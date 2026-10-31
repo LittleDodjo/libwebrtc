@@ -42,13 +42,23 @@ bool SameLuid(const LUID& a, const LUID& b) {
 
 // Игра на 100 % GPU вытесняет захват, перевод в NV12 и масштаб слоёв: они
 // идут по общим ядрам, и кадр стоит в очереди за кадрами игры — кодирование
-// 6 мс превращается в 60 (SQC-293). Как OBS и Discord, просим у планировщика
-// приоритет. REALTIME требует прав администратора — не просим. Что сработало
-// без прав, видно только в логе устройства.
+// 6 мс превращается в 60 (SQC-293). Просим у планировщика приоритет. Класс
+// «выше среднего», как у Discord: «высокий» держал захват, но заметнее
+// отнимал кадры у игры. SQUEAK_GPU_PRIORITY=high|normal — для сравнения на
+// устройстве без пересборки. REALTIME требует прав администратора — не просим.
 void RaiseGpuPriority(ID3D11Device* device) {
-  enum PriorityClass : int { kAboveNormal = 3, kHigh = 4 };
+  enum PriorityClass : int { kNormal = 2, kAboveNormal = 3, kHigh = 4 };
   using SetPriorityClass = LONG(APIENTRY*)(HANDLE, int);
   static const bool process_raised = [] {
+    char wanted[16] = {};
+    ::GetEnvironmentVariableA("SQUEAK_GPU_PRIORITY", wanted, sizeof(wanted));
+    const int priority = std::strcmp(wanted, "high") == 0     ? kHigh
+                         : std::strcmp(wanted, "normal") == 0 ? kNormal
+                                                              : kAboveNormal;
+    if (priority == kNormal) {
+      RTC_LOG(LS_INFO) << "GPU: класс приоритета процесса не трогаем";
+      return false;
+    }
     HMODULE gdi32 = ::GetModuleHandleW(L"gdi32.dll");
     if (gdi32 == nullptr) {
       gdi32 = ::LoadLibraryExW(L"gdi32.dll", nullptr,
@@ -62,16 +72,13 @@ void RaiseGpuPriority(ID3D11Device* device) {
       RTC_LOG(LS_WARNING) << "GPU: нет D3DKMTSetProcessSchedulingPriorityClass";
       return false;
     }
-    for (const int priority : {kHigh, kAboveNormal}) {
-      const LONG status = set_class(::GetCurrentProcess(), priority);
-      char hex[16];
-      std::snprintf(hex, sizeof(hex), "0x%08lX",
-                    static_cast<unsigned long>(status));
-      RTC_LOG(LS_INFO) << "GPU: класс приоритета процесса " << priority
-                       << " status=" << hex;
-      if (status == 0) return true;
-    }
-    return false;
+    const LONG status = set_class(::GetCurrentProcess(), priority);
+    char hex[16];
+    std::snprintf(hex, sizeof(hex), "0x%08lX",
+                  static_cast<unsigned long>(status));
+    RTC_LOG(LS_INFO) << "GPU: класс приоритета процесса " << priority
+                     << " status=" << hex;
+    return status == 0;
   }();
   ComPtr<IDXGIDevice> dxgi;
   HRESULT hr = E_NOINTERFACE;

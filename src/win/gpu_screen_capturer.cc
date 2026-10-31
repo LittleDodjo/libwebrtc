@@ -293,12 +293,15 @@ class GpuScreenCapturer::Impl {
       OutputSizeFor(&out_width, &out_height);
       if (out_width >= 2 && out_height >= 2) {
         ID3D11Texture2D* input = source_.Get();
-        if (show_cursor_ && composed_ != nullptr) {
+        // Скрытый курсор — кадр идёт как есть: без копии под отрисовку, это
+        // лишний проход по видеокарте под игрой.
+        if (show_cursor_ && composed_ != nullptr && cursor_visible_ &&
+            SystemCursorShown()) {
           {
             webrtc::MutexLock lock(&gpu_->lock());
             gpu_->context()->CopyResource(composed_.Get(), source_.Get());
           }
-          if (cursor_visible_) DrawCursor();
+          DrawCursor();
           input = composed_.Get();
         }
         // После серии отказов GPU-путь пробуем реже, чтобы не засыпать лог
@@ -523,6 +526,17 @@ class GpuScreenCapturer::Impl {
       return false;
     }
     return true;
+  }
+
+  // Игра прячет курсор через SetCursor(NULL) или ShowCursor(FALSE), а
+  // дубликация по-прежнему отдаёт Visible и прежнюю форму: зритель видел
+  // стрелку посреди экрана, которой у игрока нет. Как OBS, сверяемся с
+  // системой.
+  static bool SystemCursorShown() {
+    CURSORINFO info = {};
+    info.cbSize = sizeof(info);
+    if (!::GetCursorInfo(&info)) return true;
+    return (info.flags & CURSOR_SHOWING) != 0 && info.hCursor != nullptr;
   }
 
   void DrawCursor() {
