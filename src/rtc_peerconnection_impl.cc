@@ -6,6 +6,7 @@
 
 #include "api/data_channel_interface.h"
 #include "api/jsep.h"
+#include "api/transport/bitrate_settings.h"
 #include "pc/media_session.h"
 #include "rtc_base/logging.h"
 #include "rtc_data_channel_impl.h"
@@ -765,6 +766,33 @@ void RTCPeerConnectionImpl::GetStats(OnStatsCollectorSuccess success,
   rtc_peerconnection_->GetStats(rtc_callback.get());
 }
 
+namespace {
+
+// Демонстрация стартует с полосы, которую просят её слои. Иначе оценка канала
+// идёт с 300 кбит/с и растёт на 8 % в секунду, и первые ~40 с зрители видят
+// только нижний слой 270p (SQC-293, лог 31.10: через 10 с после старта
+// bwe=312kbps). Промах выше канала оценка исправит за секунду-две.
+void StartScreencastAtRequestedBitrate(webrtc::PeerConnectionInterface* pc,
+                                       webrtc::VideoTrackInterface* track,
+                                       const webrtc::RtpTransceiverInit& init) {
+  if (track == nullptr || track->GetSource() == nullptr ||
+      !track->GetSource()->is_screencast()) {
+    return;
+  }
+  int total_bps = 0;
+  for (const auto& encoding : init.send_encodings) {
+    total_bps += encoding.max_bitrate_bps.value_or(0);
+  }
+  if (total_bps <= 0) return;
+  webrtc::BitrateSettings settings;
+  settings.start_bitrate_bps = total_bps;
+  const webrtc::RTCError error = pc->SetBitrate(settings);
+  RTC_LOG(LS_INFO) << "Squeak: демонстрация стартует с " << total_bps / 1000
+                   << " кбит/с" << (error.ok() ? "" : " — SetBitrate отклонён");
+}
+
+}  // namespace
+
 scoped_refptr<RTCRtpTransceiver> RTCPeerConnectionImpl::AddTransceiver(
     scoped_refptr<RTCMediaTrack> track,
     scoped_refptr<RTCRtpTransceiverInit> init) {
@@ -778,6 +806,11 @@ scoped_refptr<RTCRtpTransceiver> RTCPeerConnectionImpl::AddTransceiver(
     VideoTrackImpl* impl = static_cast<VideoTrackImpl*>(track.get());
     errorOr = rtc_peerconnection_->AddTransceiver(
         impl->rtc_track(), initImpl->rtp_transceiver_init());
+    if (errorOr.ok()) {
+      StartScreencastAtRequestedBitrate(rtc_peerconnection_.get(),
+                                        impl->rtc_track().get(),
+                                        initImpl->rtp_transceiver_init());
+    }
   } else if (0 == kind.compare(webrtc::MediaStreamTrackInterface::kAudioKind)) {
     AudioTrackImpl* impl = static_cast<AudioTrackImpl*>(track.get());
     errorOr = rtc_peerconnection_->AddTransceiver(
