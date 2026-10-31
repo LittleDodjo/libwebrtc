@@ -10,6 +10,7 @@
 #if defined(WEBRTC_WIN)
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
@@ -37,6 +38,48 @@ constexpr size_t kMaxIdleTotal = 32;
 
 bool SameLuid(const LUID& a, const LUID& b) {
   return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
+}
+
+// Игра на 100 % GPU вытесняет захват, перевод в NV12 и масштаб слоёв: они
+// идут по общим ядрам, и кадр стоит в очереди за кадрами игры — кодирование
+// 6 мс превращается в 60 (SQC-293). Как OBS и Discord, просим у планировщика
+// приоритет. REALTIME требует прав администратора — не просим. Что сработало
+// без прав, видно только в логе устройства.
+void RaiseGpuPriority(ID3D11Device* device) {
+  enum PriorityClass : int { kAboveNormal = 3, kHigh = 4 };
+  using SetPriorityClass = LONG(APIENTRY*)(HANDLE, int);
+  static const bool process_raised = [] {
+    HMODULE gdi32 = ::GetModuleHandleW(L"gdi32.dll");
+    if (gdi32 == nullptr) {
+      gdi32 = ::LoadLibraryExW(L"gdi32.dll", nullptr,
+                               LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    const auto set_class = gdi32 == nullptr
+        ? nullptr
+        : reinterpret_cast<SetPriorityClass>(::GetProcAddress(
+              gdi32, "D3DKMTSetProcessSchedulingPriorityClass"));
+    if (set_class == nullptr) {
+      RTC_LOG(LS_WARNING) << "GPU: нет D3DKMTSetProcessSchedulingPriorityClass";
+      return false;
+    }
+    for (const int priority : {kHigh, kAboveNormal}) {
+      const LONG status = set_class(::GetCurrentProcess(), priority);
+      char hex[16];
+      std::snprintf(hex, sizeof(hex), "0x%08lX",
+                    static_cast<unsigned long>(status));
+      RTC_LOG(LS_INFO) << "GPU: класс приоритета процесса " << priority
+                       << " status=" << hex;
+      if (status == 0) return true;
+    }
+    return false;
+  }();
+  ComPtr<IDXGIDevice> dxgi;
+  HRESULT hr = E_NOINTERFACE;
+  if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgi)))) {
+    hr = dxgi->SetGPUThreadPriority(7);
+  }
+  RTC_LOG(LS_INFO) << "GPU: приоритет устройства 7 hr=" << hr
+                   << ", класс процесса " << (process_raised ? "поднят" : "нет");
 }
 
 // Реестр контекстов по адаптеру. Слабых ссылок у webrtc::scoped_refptr нет,
@@ -223,6 +266,7 @@ bool GpuContext::Init(IDXGIAdapter1* adapter) {
   if (SUCCEEDED(device_.As(&multithread))) {
     multithread->SetMultithreadProtected(TRUE);
   }
+  RaiseGpuPriority(device_.Get());
 
   char name[128] = {};
   ::WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1,
