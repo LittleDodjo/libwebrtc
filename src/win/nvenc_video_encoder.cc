@@ -296,10 +296,12 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
       key_frame = (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
     }
 
+    const int64_t encode_start = webrtc::TimeMicros();
     if (reconfigure_needed_) {
       // Перенастройку с кадрами в работе NVENC не обещает — сначала отдаём их.
       DeliverPending(/*block=*/true);
       if (!Reconfigure()) return WEBRTC_VIDEO_CODEC_ERROR;
+      ++stats_reconfigures_;
     }
 
     // Кадр — текстура на устройстве сессии. Нативный кадр с того же
@@ -418,6 +420,7 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     } else {
       DeliverReady();
     }
+    stats_encode_us_ += webrtc::TimeMicros() - encode_start;
     LogStats();
     return WEBRTC_VIDEO_CODEC_OK;
   }
@@ -782,10 +785,14 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
                      << stats_wait_us_ / stats_frames_ / 1000.0
                      << " мс/кадр, отправка "
                      << stats_submit_us_ / stats_frames_ / 1000.0
-                     << " мс/кадр";
+                     << " мс/кадр, весь Encode "
+                     << stats_encode_us_ / stats_frames_ / 1000.0
+                     << " мс/кадр, перенастроек " << stats_reconfigures_;
     stats_frames_ = 0;
+    stats_reconfigures_ = 0;
     stats_wait_us_ = 0;
     stats_submit_us_ = 0;
+    stats_encode_us_ = 0;
     stats_max_pending_ = 0;
   }
 
@@ -860,8 +867,10 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   bool async_ = false;
 
   int stats_frames_ = 0;
+  int stats_reconfigures_ = 0;
   int64_t stats_wait_us_ = 0;
   int64_t stats_submit_us_ = 0;
+  int64_t stats_encode_us_ = 0;
   size_t stats_max_pending_ = 0;
 
   webrtc::EncodedImageCallback* callback_ = nullptr;

@@ -30,6 +30,10 @@
 #include <timeapi.h>
 #include <wrl/client.h>
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 namespace squeak {
 namespace {
 
@@ -153,12 +157,19 @@ class GpuScreenCapturer::Impl {
   }
 
   void Run() {
-    // Квант таймера 1 мс: иначе таймауты AcquireNextFrame округляются до
-    // 15.6 мс и каденция разваливается. MMCSS поднимает приоритет потока до
-    // уровня мультимедийных задач — захват не теснится UI и сетью.
+    // Квант таймера 1 мс: без таймера высокого разрешения (до Windows 10
+    // 1803) ожидание иначе округляется до 15.6 мс и каденция разваливается.
+    // MMCSS поднимает приоритет потока до уровня мультимедийных задач —
+    // захват не теснится UI и сетью.
     ::timeBeginPeriod(1);
     DWORD task_index = 0;
     HANDLE mmcss = ::AvSetMmThreadCharacteristicsW(L"Capture", &task_index);
+    HANDLE timer = ::CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+    if (timer == nullptr) {
+      timer = ::CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    }
 
     int64_t deadline_us = webrtc::TimeMicros() + period_us_;
     while (running_.load()) {
@@ -170,18 +181,19 @@ class GpuScreenCapturer::Impl {
         }
       }
 
-      const int64_t now = webrtc::TimeMicros();
-      const int64_t remaining = deadline_us - now;
-      // Таймаут в целых миллисекундах вниз: лучше вернуться на долю
-      // миллисекунды раньше и добрать опросом, чем проспать дедлайн.
-      const UINT timeout_ms =
-          remaining > 1000 ? static_cast<UINT>(std::min<int64_t>(remaining / 1000, 100))
-                           : 0;
-      Acquire(timeout_ms);
-
-      if (webrtc::TimeMicros() < deadline_us) continue;
-
+      // Ждём дедлайн таймером, а кадр забираем без ожидания. С таймаутом
+      // поток почти весь период сидел в AcquireNextFrame на устройстве,
+      // общем с NVENC, и кодек отдавал 15–30 кадров из 60 (SQC-293). DWM
+      // копит обновления, так что опрос раз в период ничего не теряет.
+      WaitUntil(timer, deadline_us);
+      const int64_t acquire_start = webrtc::TimeMicros();
+      Acquire(0);
+      const int64_t emit_start = webrtc::TimeMicros();
       Emit();
+      stats_acquire_us_ += emit_start - acquire_start;
+      stats_emit_us_ += webrtc::TimeMicros() - emit_start;
+      LogStats();
+
       deadline_us += period_us_;
       // Отставание больше периода (сон машины, долгий блит) — не навёрстываем
       // пачкой, а начинаем отсчёт заново.
@@ -190,8 +202,38 @@ class GpuScreenCapturer::Impl {
       }
     }
 
+    if (timer != nullptr) ::CloseHandle(timer);
     if (mmcss != nullptr) ::AvRevertMmThreadCharacteristics(mmcss);
     ::timeEndPeriod(1);
+  }
+
+  static void WaitUntil(HANDLE timer, int64_t deadline_us) {
+    const int64_t remaining_us = deadline_us - webrtc::TimeMicros();
+    if (remaining_us <= 0) return;
+    LARGE_INTEGER due;
+    due.QuadPart = -remaining_us * 10;  // относительное время в 100 нс
+    if (timer != nullptr &&
+        ::SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+      ::WaitForSingleObject(timer, INFINITE);
+      return;
+    }
+    ::Sleep(static_cast<DWORD>(remaining_us / 1000));
+  }
+
+  void LogStats() {
+    if (++stats_emits_ < kStatsEvery) return;
+    RTC_LOG(LS_INFO) << "GPU-capture: за " << stats_emits_ << " кадров новых "
+                     << stats_new_ << ", повторов "
+                     << stats_emits_ - stats_new_ << ", пул пуст "
+                     << stats_pool_empty_ << ", Acquire "
+                     << stats_acquire_us_ / stats_emits_ / 1000.0
+                     << " мс/кадр, отдача "
+                     << stats_emit_us_ / stats_emits_ / 1000.0 << " мс/кадр";
+    stats_emits_ = 0;
+    stats_new_ = 0;
+    stats_pool_empty_ = 0;
+    stats_acquire_us_ = 0;
+    stats_emit_us_ = 0;
   }
 
   // Забирает у DWM следующий кадр, если он есть, и переносит его в свою копию.
@@ -310,12 +352,14 @@ class GpuScreenCapturer::Impl {
                              gpu_failures_ % 120 == 0;
         webrtc::scoped_refptr<D3D11FrameBuffer> frame =
             try_gpu ? gpu_->CreateNV12Frame(out_width, out_height) : nullptr;
+        if (try_gpu && frame == nullptr) ++stats_pool_empty_;
         if (frame != nullptr &&
             gpu_->Blit(input, 0, nullptr, frame->texture(), 0, nullptr,
                        /*letterbox=*/false)) {
           LogOutputSize(out_width, out_height);
           last_ = frame;
           gpu_failures_ = 0;
+          ++stats_new_;
         } else if (++gpu_failures_ >= kGpuFailuresBeforeReadback) {
           // Пул не отдаёт текстуры или видеопроцессор не пишет в них — обычно
           // драйвер, не принимающий общие NV12-текстуры. Чёрный экран хуже
@@ -616,6 +660,15 @@ class GpuScreenCapturer::Impl {
   static constexpr int kGpuFailuresBeforeReadback = 3;
   int gpu_failures_ = 0;
   ComPtr<ID3D11Texture2D> readback_nv12_;
+
+  // Сводка в лог раз в kStatsEvery кадров: сколько из отданных новых и
+  // сколько времени уходит на забор кадра и на отдачу его потребителям.
+  static constexpr int kStatsEvery = 600;
+  int stats_emits_ = 0;
+  int stats_new_ = 0;
+  int stats_pool_empty_ = 0;
+  int64_t stats_acquire_us_ = 0;
+  int64_t stats_emit_us_ = 0;
 
   std::atomic<int> target_width_{0};
   std::atomic<int> target_height_{0};
