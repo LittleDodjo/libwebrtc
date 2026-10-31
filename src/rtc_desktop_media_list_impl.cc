@@ -47,17 +47,24 @@ RTCDesktopMediaListImpl::RTCDesktopMediaListImpl(DesktopType type,
   }
 #endif
   callback_ = std::make_unique<CallbackProxy>();
-  thread_->BlockingCall([this, type] {
-    if (type == kScreen) {
-      capturer_ = webrtc::DesktopCapturer::CreateScreenCapturer(options_);
-    } else {
-      capturer_ = webrtc::DesktopCapturer::CreateWindowCapturer(options_);
-    }
-    capturer_->Start(callback_.get());
-  });
+  thread_->BlockingCall([this] { EnsureCapturer(); });
 }
 
 RTCDesktopMediaListImpl::~RTCDesktopMediaListImpl() { thread_->Stop(); }
+
+void RTCDesktopMediaListImpl::EnsureCapturer() {
+  if (capturer_ != nullptr) return;
+  if (type_ == kScreen) {
+    capturer_ = webrtc::DesktopCapturer::CreateScreenCapturer(options_);
+  } else {
+    capturer_ = webrtc::DesktopCapturer::CreateWindowCapturer(options_);
+  }
+  capturer_->Start(callback_.get());
+}
+
+void RTCDesktopMediaListImpl::ReleaseCapturer() {
+  thread_->BlockingCall([this] { capturer_.reset(); });
+}
 
 int32_t RTCDesktopMediaListImpl::UpdateSourceList(bool force_reload,
                                                   bool get_thumbnail) {
@@ -73,8 +80,10 @@ int32_t RTCDesktopMediaListImpl::UpdateSourceList(bool force_reload,
   }
 
   webrtc::DesktopCapturer::SourceList new_sources;
-  thread_->BlockingCall(
-      [this, &new_sources] { capturer_->GetSourceList(&new_sources); });
+  thread_->BlockingCall([this, &new_sources] {
+    EnsureCapturer();
+    capturer_->GetSourceList(&new_sources);
+  });
 
   typedef std::set<webrtc::DesktopCapturer::SourceId> SourceSet;
   SourceSet new_source_set;
@@ -160,6 +169,7 @@ bool RTCDesktopMediaListImpl::GetThumbnail(scoped_refptr<MediaSource> source,
                                            bool notify) {
   thread_->PostTask([this, source, notify] {
     MediaSourceImpl* source_impl = static_cast<MediaSourceImpl*>(source.get());
+    EnsureCapturer();
     if (capturer_->SelectSource(source_impl->source_id())) {
       callback_->SetCallback([&](webrtc::DesktopCapturer::Result result,
                                  std::unique_ptr<webrtc::DesktopFrame> frame) {

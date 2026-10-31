@@ -15,6 +15,14 @@ RTCDesktopDeviceImpl::~RTCDesktopDeviceImpl() {}
 scoped_refptr<RTCDesktopCapturer> RTCDesktopDeviceImpl::CreateDesktopCapturer(
     scoped_refptr<MediaSource> source, bool showCursor) {
   MediaSourceImpl* source_impl = static_cast<MediaSourceImpl*>(source.get());
+#ifdef WEBRTC_WIN
+  // Превью экранов держат DXGI-дубликацию монитора — без этого GPU-захват
+  // откатывается на путь webrtc со стрелкой вместо скрытого курсора (SQC-293).
+  if (source_impl->type() == kScreen) {
+    auto list = desktop_media_lists_.find(kScreen);
+    if (list != desktop_media_lists_.end()) list->second->ReleaseCapturer();
+  }
+#endif
   return new RefCountedObject<RTCDesktopCapturerImpl>(
       source_impl->type(), source_impl->source_id(), signaling_thread_, source,
       showCursor);

@@ -95,7 +95,14 @@ class RTCDesktopMediaListImpl : public RTCDesktopMediaList {
   bool GetThumbnail(scoped_refptr<MediaSource> source,
                     bool notify = false) override;
 
+  // Отпускает захватчик превью: DXGI даёт процессу одну дубликацию на
+  // монитор, и пока её держат превью, GPU-захват демонстрации не поднимается
+  // (SQC-293). Следующий список или превью создадут захватчик заново.
+  void ReleaseCapturer();
+
  private:
+  void EnsureCapturer();
+
   class CallbackProxy : public webrtc::DesktopCapturer::Callback {
    public:
     CallbackProxy() {}
