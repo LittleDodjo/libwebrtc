@@ -7,9 +7,11 @@
 
 #include "src/win/nvenc_video_encoder.h"
 
+#include <algorithm>
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +28,7 @@
 #include "modules/video_coding/include/video_error_codes.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
+#include "rtc_base/time_utils.h"
 #include "third_party/libyuv/include/libyuv/planar_functions.h"
 
 #if defined(WEBRTC_WIN)
@@ -54,6 +57,16 @@ constexpr UINT kNvidiaVendorId = 0x10DE;
 // одни и те же текстуры по кругу, поэтому регистрация — разовая операция на
 // текстуру, а не на кадр. Выше потолка — старые снимаем.
 constexpr size_t kMaxRegistrations = 12;
+
+// Кадров в работе у NVENC одновременно. Под игрой видеокарта отдаёт кадр за
+// 25–30 мс при бюджете 16,7: синхронный энкодер ждал каждый, и кадры, пришедшие
+// за это время, WebRTC выбрасывал — 20–30 к/с (SQC-293). С конвейером выход
+// забирается на следующих вызовах, задержка та же, частота держится, пока
+// видеокарта укладывается в kInFlight кадров.
+constexpr size_t kInFlight = 3;
+
+// Раз в столько кадров — строка в лог: сколько ждали выход и глубина конвейера.
+constexpr int kStatsEvery = 600;
 
 struct NvencApi {
   HMODULE library = nullptr;
@@ -231,6 +244,14 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   int32_t Release() override {
     const NvencApi& api = GetNvencApi();
     if (session_.encoder() != nullptr) {
+      // Кадры в работе не отдаём — энкодер закрывают, — но ждём, пока NVENC
+      // их дочитает: снимать отображение текстуры раньше нельзя.
+      for (Pending& pending : pending_) {
+        if (async_) ::WaitForSingleObject(slots_[pending.slot].event, 200);
+        if (pending.mapped != nullptr) {
+          api.fn.nvEncUnmapInputResource(session_.encoder(), pending.mapped);
+        }
+      }
       for (auto& registration : registrations_) {
         api.fn.nvEncUnregisterResource(session_.encoder(),
                                        registration.handle);
@@ -238,12 +259,24 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
       if (input_buffer_ != nullptr) {
         api.fn.nvEncDestroyInputBuffer(session_.encoder(), input_buffer_);
       }
-      if (output_buffer_ != nullptr) {
-        api.fn.nvEncDestroyBitstreamBuffer(session_.encoder(), output_buffer_);
+      for (Slot& slot : slots_) {
+        if (slot.event != nullptr) {
+          NV_ENC_EVENT_PARAMS event = {};
+          event.version = NV_ENC_EVENT_PARAMS_VER;
+          event.completionEvent = slot.event;
+          api.fn.nvEncUnregisterAsyncEvent(session_.encoder(), &event);
+        }
+        if (slot.output != nullptr) {
+          api.fn.nvEncDestroyBitstreamBuffer(session_.encoder(), slot.output);
+        }
       }
     }
+    for (Slot& slot : slots_) {
+      if (slot.event != nullptr) ::CloseHandle(slot.event);
+    }
+    pending_.clear();
+    slots_.clear();
     input_buffer_ = nullptr;
-    output_buffer_ = nullptr;
     registrations_.clear();
     session_.Destroy();
     return WEBRTC_VIDEO_CODEC_OK;
@@ -263,7 +296,11 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
       key_frame = (*frame_types)[0] == webrtc::VideoFrameType::kVideoFrameKey;
     }
 
-    if (reconfigure_needed_ && !Reconfigure()) return WEBRTC_VIDEO_CODEC_ERROR;
+    if (reconfigure_needed_) {
+      // Перенастройку с кадрами в работе NVENC не обещает — сначала отдаём их.
+      DeliverPending(/*block=*/true);
+      if (!Reconfigure()) return WEBRTC_VIDEO_CODEC_ERROR;
+    }
 
     // Кадр — текстура на устройстве сессии. Нативный кадр с того же
     // устройства остаётся собой; всё остальное (NV12 или I420 из памяти,
@@ -284,6 +321,15 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     // В энкодер приходят только текстуры пула — не массивы, нулевой подресурс.
     RTC_DCHECK_EQ(input->subresource(), 0u);
     const NvencApi& api = GetNvencApi();
+
+    // Готовое отдаём по порядку; если все выходные буферы заняты — ждём
+    // старший кадр, иначе новому некуда писать.
+    DeliverReady();
+    if (pending_.size() >= slots_.size()) {
+      const int64_t wait_start = webrtc::TimeMicros();
+      DeliverFront();
+      stats_wait_us_ += webrtc::TimeMicros() - wait_start;
+    }
 
     // Текстура напрямую; если драйвер её не регистрирует — прежний путь через
     // входной буфер в системной памяти. Чёрный экран хуже лишней копии.
@@ -314,11 +360,21 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
       picture_input = input_buffer_;
     }
 
+    // Свободный буфер есть всегда: выше старший кадр отдан, если все заняты.
+    size_t slot = 0;
+    while (std::any_of(pending_.begin(), pending_.end(),
+                       [slot](const Pending& p) { return p.slot == slot; })) {
+      ++slot;
+    }
+    RTC_DCHECK_LT(slot, slots_.size());
+    if (async_) ::ResetEvent(slots_[slot].event);
+
     NV_ENC_PIC_PARAMS pic = {};
     pic.version = NV_ENC_PIC_PARAMS_VER;
     pic.inputBuffer = picture_input;
     pic.bufferFmt = picture_format;
-    pic.outputBitstream = output_buffer_;
+    pic.outputBitstream = slots_[slot].output;
+    pic.completionEvent = async_ ? slots_[slot].event : nullptr;
     pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     pic.inputWidth = width_;
     pic.inputHeight = height_;
@@ -329,21 +385,41 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
                            NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
     }
 
+    const int64_t submit_start = webrtc::TimeMicros();
     const NVENCSTATUS status =
         api.fn.nvEncEncodePicture(session_.encoder(), &pic);
-    int32_t result = WEBRTC_VIDEO_CODEC_OK;
+    stats_submit_us_ += webrtc::TimeMicros() - submit_start;
     if (status != NV_ENC_SUCCESS) {
       RTC_LOG(LS_ERROR) << "NVENC: nvEncEncodePicture status=" << status;
-      result = WEBRTC_VIDEO_CODEC_ERROR;
+      if (map.mappedResource != nullptr) {
+        api.fn.nvEncUnmapInputResource(session_.encoder(), map.mappedResource);
+      }
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+
+    // Текстура остаётся отображённой и живой, пока выход не прочитан: NVENC
+    // может ещё читать из неё.
+    Pending pending;
+    pending.slot = slot;
+    pending.mapped = map.mappedResource;
+    pending.input = input;
+    pending.rtp_timestamp = frame.rtp_timestamp();
+    pending.ntp_time_ms = frame.ntp_time_ms();
+    pending.capture_time_ms = frame.render_time_ms();
+    pending.rotation = frame.rotation();
+    pending.color_space = frame.color_space();
+    pending_.push_back(std::move(pending));
+    stats_max_pending_ = std::max(stats_max_pending_, pending_.size());
+
+    // Без асинхронного режима и на запасном входе (один буфер в системной
+    // памяти) — по-старому: ждём кадр сразу.
+    if (!async_ || host_input_) {
+      DeliverPending(/*block=*/true);
     } else {
-      result = DeliverBitstream(frame);
+      DeliverReady();
     }
-    // Текстуру отпускаем только после того, как битстрим прочитан: до этого
-    // NVENC может ещё читать из неё.
-    if (map.mappedResource != nullptr) {
-      api.fn.nvEncUnmapInputResource(session_.encoder(), map.mappedResource);
-    }
-    return result;
+    LogStats();
+    return WEBRTC_VIDEO_CODEC_OK;
   }
 
   // Запасной вход: буфер NVENC в системной памяти, кадр читается с видеокарты
@@ -385,7 +461,12 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   }
 
   void SetRates(const RateControlParameters& parameters) override {
-    if (parameters.bitrate.get_sum_bps() == 0) return;
+    // Слой поставили на паузу: новых Encode не будет, и кадры в работе
+    // отдаём сейчас, а не при возобновлении устаревшими.
+    if (parameters.bitrate.get_sum_bps() == 0) {
+      DeliverPending(/*block=*/true);
+      return;
+    }
     const int target = static_cast<int>(parameters.bitrate.get_sum_bps());
     const int framerate = parameters.framerate_fps > 1.0
                               ? static_cast<int>(parameters.framerate_fps + 0.5)
@@ -424,6 +505,23 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
   struct Registration {
     ComPtr<ID3D11Texture2D> texture;
     NV_ENC_REGISTERED_PTR handle = nullptr;
+  };
+
+  struct Slot {
+    NV_ENC_OUTPUT_PTR output = nullptr;
+    HANDLE event = nullptr;
+  };
+
+  // Кадр, отданный NVENC: выход ещё не прочитан, текстура отображена.
+  struct Pending {
+    size_t slot = 0;
+    NV_ENC_INPUT_PTR mapped = nullptr;
+    webrtc::scoped_refptr<D3D11FrameBuffer> input;
+    uint32_t rtp_timestamp = 0;
+    int64_t ntp_time_ms = 0;
+    int64_t capture_time_ms = 0;
+    webrtc::VideoRotation rotation = webrtc::kVideoRotation_0;
+    std::optional<webrtc::ColorSpace> color_space;
   };
 
   int OpenEncoder() {
@@ -499,6 +597,8 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     init_params_.frameRateDen = 1;
     init_params_.enablePTD = 1;
     init_params_.encodeConfig = &config_;
+    async_ = session_.Cap(NV_ENC_CAPS_ASYNC_ENCODE_SUPPORT) != 0;
+    init_params_.enableEncodeAsync = async_ ? 1 : 0;
 
     NVENCSTATUS status =
         api.fn.nvEncInitializeEncoder(session_.encoder(), &init_params_);
@@ -508,20 +608,41 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
 
-    NV_ENC_CREATE_BITSTREAM_BUFFER output = {};
-    output.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-    status = api.fn.nvEncCreateBitstreamBuffer(session_.encoder(), &output);
-    if (status != NV_ENC_SUCCESS) {
-      Release();
-      return WEBRTC_VIDEO_CODEC_ERROR;
+    const size_t slot_count = async_ ? kInFlight : 1;
+    for (size_t i = 0; i < slot_count; ++i) {
+      NV_ENC_CREATE_BITSTREAM_BUFFER output = {};
+      output.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+      status = api.fn.nvEncCreateBitstreamBuffer(session_.encoder(), &output);
+      if (status != NV_ENC_SUCCESS) {
+        Release();
+        return WEBRTC_VIDEO_CODEC_ERROR;
+      }
+      slots_.push_back(Slot{output.bitstreamBuffer, nullptr});
+      if (!async_) continue;
+      // Ручной сброс: проверка готовности без ожидания не должна гасить
+      // событие до того, как кадр заберут. Сбрасываем перед отправкой.
+      HANDLE event = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      NV_ENC_EVENT_PARAMS params = {};
+      params.version = NV_ENC_EVENT_PARAMS_VER;
+      params.completionEvent = event;
+      if (event == nullptr ||
+          api.fn.nvEncRegisterAsyncEvent(session_.encoder(), &params) !=
+              NV_ENC_SUCCESS) {
+        RTC_LOG(LS_ERROR) << "NVENC: событие завершения не зарегистрировано";
+        if (event != nullptr) ::CloseHandle(event);
+        Release();
+        return WEBRTC_VIDEO_CODEC_ERROR;
+      }
+      slots_.back().event = event;
     }
-    output_buffer_ = output.bitstreamBuffer;
 
     reconfigure_needed_ = false;
     RTC_LOG(LS_INFO) << "NVENC: инициализирован " << width_ << "x" << height_
                      << "@" << framerate_ << " " << target_bitrate_bps_
                      << " bit/s, P4 low-latency, two-pass, cabac=" << cabac
-                     << " 8x8=" << transform_8x8;
+                     << " 8x8=" << transform_8x8 << ", "
+                     << (async_ ? "конвейер на " : "синхронно, ")
+                     << slot_count << " кадр.";
     return WEBRTC_VIDEO_CODEC_OK;
   }
 
@@ -580,9 +701,19 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     }
     const NvencApi& api = GetNvencApi();
     if (registrations_.size() >= kMaxRegistrations) {
-      api.fn.nvEncUnregisterResource(session_.encoder(),
-                                     registrations_.front().handle);
-      registrations_.pop_front();
+      // Текстуру кадра в работе снимать нельзя: NVENC ещё читает её.
+      const auto victim = std::find_if(
+          registrations_.begin(), registrations_.end(),
+          [this](const Registration& registration) {
+            return std::none_of(
+                pending_.begin(), pending_.end(), [&](const Pending& pending) {
+                  return pending.input->texture() == registration.texture.Get();
+                });
+          });
+      if (victim != registrations_.end()) {
+        api.fn.nvEncUnregisterResource(session_.encoder(), victim->handle);
+        registrations_.erase(victim);
+      }
     }
 
     D3D11_TEXTURE2D_DESC desc = {};
@@ -610,16 +741,65 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     return registration.handle;
   }
 
-  int32_t DeliverBitstream(const webrtc::VideoFrame& frame) {
+  bool FrontReady() const {
+    return !pending_.empty() && async_ &&
+           ::WaitForSingleObject(slots_[pending_.front().slot].event, 0) ==
+               WAIT_OBJECT_0;
+  }
+
+  // Всё, что NVENC уже закончил, — по порядку и без ожидания.
+  void DeliverReady() {
+    while (FrontReady()) DeliverFront();
+  }
+
+  // Все кадры в работе; block — ждать незаконченные.
+  void DeliverPending(bool block) {
+    while (!pending_.empty() && (block || FrontReady())) DeliverFront();
+  }
+
+  void DeliverFront() {
+    Pending pending = std::move(pending_.front());
+    pending_.pop_front();
     const NvencApi& api = GetNvencApi();
+    // Событие ручного сброса: проверка готовности его не гасит, и ожидание
+    // здесь не повиснет. Таймаут — страховка от зависшего драйвера.
+    if (async_ &&
+        ::WaitForSingleObject(slots_[pending.slot].event, 1000) != WAIT_OBJECT_0) {
+      RTC_LOG(LS_ERROR) << "NVENC: кадр не закончился за секунду";
+    }
+    DeliverBitstream(pending);
+    if (pending.mapped != nullptr) {
+      api.fn.nvEncUnmapInputResource(session_.encoder(), pending.mapped);
+    }
+  }
+
+  void LogStats() {
+    if (++stats_frames_ < kStatsEvery) return;
+    RTC_LOG(LS_INFO) << "NVENC " << width_ << "x" << height_ << ": "
+                     << (async_ ? "конвейер" : "синхронно")
+                     << ", в работе до " << stats_max_pending_
+                     << ", ожидание выхода "
+                     << stats_wait_us_ / stats_frames_ / 1000.0
+                     << " мс/кадр, отправка "
+                     << stats_submit_us_ / stats_frames_ / 1000.0
+                     << " мс/кадр";
+    stats_frames_ = 0;
+    stats_wait_us_ = 0;
+    stats_submit_us_ = 0;
+    stats_max_pending_ = 0;
+  }
+
+  void DeliverBitstream(const Pending& pending) {
+    const NvencApi& api = GetNvencApi();
+    const NV_ENC_OUTPUT_PTR output = slots_[pending.slot].output;
     NV_ENC_LOCK_BITSTREAM lock = {};
     lock.version = NV_ENC_LOCK_BITSTREAM_VER;
-    lock.outputBitstream = output_buffer_;
+    lock.outputBitstream = output;
     lock.doNotWait = 0;
     if (api.fn.nvEncLockBitstream(session_.encoder(), &lock) !=
         NV_ENC_SUCCESS) {
       RTC_LOG(LS_ERROR) << "NVENC: nvEncLockBitstream failed";
-      return WEBRTC_VIDEO_CODEC_ERROR;
+      return;
     }
 
     webrtc::EncodedImage image;
@@ -630,15 +810,15 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
     const bool key_frame = lock.pictureType == NV_ENC_PIC_TYPE_IDR ||
                            lock.pictureType == NV_ENC_PIC_TYPE_I;
     const int avg_qp = static_cast<int>(lock.frameAvgQP);
-    api.fn.nvEncUnlockBitstream(session_.encoder(), output_buffer_);
+    api.fn.nvEncUnlockBitstream(session_.encoder(), output);
 
     image._encodedWidth = width_;
     image._encodedHeight = height_;
-    image.SetRtpTimestamp(frame.rtp_timestamp());
-    image.ntp_time_ms_ = frame.ntp_time_ms();
-    image.capture_time_ms_ = frame.render_time_ms();
-    image.rotation_ = frame.rotation();
-    image.SetColorSpace(frame.color_space());
+    image.SetRtpTimestamp(pending.rtp_timestamp);
+    image.ntp_time_ms_ = pending.ntp_time_ms;
+    image.capture_time_ms_ = pending.capture_time_ms;
+    image.rotation_ = pending.rotation;
+    image.SetColorSpace(pending.color_space);
     image.content_type_ = mode_ == webrtc::VideoCodecMode::kScreensharing
                               ? webrtc::VideoContentType::SCREENSHARE
                               : webrtc::VideoContentType::UNSPECIFIED;
@@ -665,16 +845,24 @@ class NvencH264Encoder : public webrtc::VideoEncoder {
       RTC_LOG(LS_WARNING) << "NVENC: OnEncodedImage error " << result.error;
     }
     bitrate_adjuster_.Update(size);
-    return WEBRTC_VIDEO_CODEC_OK;
   }
 
   NvencSession session_;
   NV_ENC_INITIALIZE_PARAMS init_params_ = {};
   NV_ENC_CONFIG config_ = {};
-  NV_ENC_OUTPUT_PTR output_buffer_ = nullptr;
   NV_ENC_INPUT_PTR input_buffer_ = nullptr;
   bool host_input_ = false;
   std::deque<Registration> registrations_;
+
+  // Выходной буфер и событие завершения на каждый кадр в работе.
+  std::vector<Slot> slots_;
+  std::deque<Pending> pending_;
+  bool async_ = false;
+
+  int stats_frames_ = 0;
+  int64_t stats_wait_us_ = 0;
+  int64_t stats_submit_us_ = 0;
+  size_t stats_max_pending_ = 0;
 
   webrtc::EncodedImageCallback* callback_ = nullptr;
   webrtc::H264BitstreamParser bitstream_parser_;
