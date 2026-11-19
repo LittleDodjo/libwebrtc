@@ -92,7 +92,7 @@ index 81cb890185..be62c5d1f3 100644
          std::move(deps.video_encoder_factory),
          std::move(deps.video_decoder_factory), env.field_trials());
 diff --git a/api/peer_connection_interface.h b/api/peer_connection_interface.h
-index af2152253b..711a3ca754 100644
+index 74022598db..3ee32ce786 100644
 --- a/api/peer_connection_interface.h
 +++ b/api/peer_connection_interface.h
 @@ -126,6 +126,7 @@
@@ -103,7 +103,7 @@ index af2152253b..711a3ca754 100644
  #include "media/base/media_config.h"
  // TODO(bugs.webrtc.org/7447): We plan to provide a way to let applications
  // inject a PacketSocketFactory and/or NetworkManager, and not expose
-@@ -1482,6 +1483,7 @@ struct RTC_EXPORT PeerConnectionFactoryDependencies final {
+@@ -1483,6 +1484,7 @@ struct RTC_EXPORT PeerConnectionFactoryDependencies final {
    scoped_refptr<AudioEncoderFactory> audio_encoder_factory;
    scoped_refptr<AudioDecoderFactory> audio_decoder_factory;
    scoped_refptr<AudioMixer> audio_mixer;
@@ -307,10 +307,10 @@ index d58b7ff97e..817a41862d 100644
  
    ~AudioState() override {}
 diff --git a/media/engine/webrtc_voice_engine.cc b/media/engine/webrtc_voice_engine.cc
-index fc5f93d109..e4577a481e 100644
+index d7ab45040c..0d830d2ab6 100644
 --- a/media/engine/webrtc_voice_engine.cc
 +++ b/media/engine/webrtc_voice_engine.cc
-@@ -470,7 +470,8 @@ WebRtcVoiceEngine::WebRtcVoiceEngine(
+@@ -471,7 +471,8 @@ WebRtcVoiceEngine::WebRtcVoiceEngine(
      scoped_refptr<AudioDecoderFactory> decoder_factory,
      scoped_refptr<AudioMixer> audio_mixer,
      scoped_refptr<AudioProcessing> audio_processing,
@@ -320,7 +320,7 @@ index fc5f93d109..e4577a481e 100644
      : env_(env),
        minimized_resampling_on_mobile_trial_enabled_(
            env_.field_trials().IsEnabled(
-@@ -481,6 +482,7 @@ WebRtcVoiceEngine::WebRtcVoiceEngine(
+@@ -482,6 +483,7 @@ WebRtcVoiceEngine::WebRtcVoiceEngine(
        encoder_factory_(std::move(encoder_factory)),
        decoder_factory_(std::move(decoder_factory)),
        apm_(std::move(audio_processing)),
@@ -328,7 +328,7 @@ index fc5f93d109..e4577a481e 100644
        legacy_send_codecs_(
            LegacyCollectCodecs(encoder_factory_->GetSupportedEncoders(),
                                !payload_types_in_transport_trial_enabled_)),
-@@ -500,6 +502,9 @@ WebRtcVoiceEngine::WebRtcVoiceEngine(
+@@ -501,6 +503,9 @@ WebRtcVoiceEngine::WebRtcVoiceEngine(
      } else {
        config.audio_mixer = AudioMixerImpl::Create();
      }
@@ -339,10 +339,10 @@ index fc5f93d109..e4577a481e 100644
      config.audio_device_module = adm_;
      if (audio_frame_processor) {
 diff --git a/media/engine/webrtc_voice_engine.h b/media/engine/webrtc_voice_engine.h
-index 01ec1aabfd..26a72c0f42 100644
+index dfa9ba0da2..16520fe2c2 100644
 --- a/media/engine/webrtc_voice_engine.h
 +++ b/media/engine/webrtc_voice_engine.h
-@@ -86,7 +86,8 @@ class WebRtcVoiceEngine final : public VoiceEngineInterface {
+@@ -88,7 +88,8 @@ class WebRtcVoiceEngine final : public VoiceEngineInterface {
                      scoped_refptr<AudioDecoderFactory> decoder_factory,
                      scoped_refptr<AudioMixer> audio_mixer,
                      scoped_refptr<AudioProcessing> audio_processing,
@@ -352,10 +352,10 @@ index 01ec1aabfd..26a72c0f42 100644
  
    WebRtcVoiceEngine() = delete;
    WebRtcVoiceEngine(const WebRtcVoiceEngine&) = delete;
-@@ -169,6 +170,8 @@ class WebRtcVoiceEngine final : public VoiceEngineInterface {
-   const scoped_refptr<AudioDecoderFactory> decoder_factory_;
+@@ -191,6 +192,8 @@ class WebRtcVoiceEngine final : public VoiceEngineInterface {
    // The audio processing module.
-   scoped_refptr<AudioProcessing> apm_ RTC_GUARDED_BY(worker_thread_checker_);
+   const scoped_refptr<AudioProcessing> apm_
+       RTC_GUARDED_BY(worker_thread_checker_);
 +  // The audio transport factory.
 +  scoped_refptr<AudioTransportFactory> audio_transport_factory_;
    // The primary instance of WebRtc VoiceEngine.
