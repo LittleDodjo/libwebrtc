@@ -377,25 +377,29 @@ rtc_shared_library("libwebrtc") {
   }
 }
 
-rtc_test("libwebrtc_cpp_api_unittests") {
-  testonly = true
+# squeak: сборка Windows идёт без тестов WebRTC (rtc_include_tests=false) — так
+# короче; без них у этой цели нет //test:test_main, и gn gen падает.
+if (rtc_include_tests) {
+  rtc_test("libwebrtc_cpp_api_unittests") {
+    testonly = true
 
-  sources = [
-     "test/field_trials.test.cc",
-     "test/peerconnection_factory.test.cc",
-     "test/video_processor.test.cc",
-  ]
+    sources = [
+       "test/field_trials.test.cc",
+       "test/peerconnection_factory.test.cc",
+       "test/video_processor.test.cc",
+    ]
 
-  if (is_clang) {
-    # See the comment in the "libwebrtc" target above.
-    suppressed_configs = [ "//build/config/clang:unsafe_buffers" ]
-    cflags = [ "-Wno-deprecated-declarations" ]
+    if (is_clang) {
+      # See the comment in the "libwebrtc" target above.
+      suppressed_configs = [ "//build/config/clang:unsafe_buffers" ]
+      cflags = [ "-Wno-deprecated-declarations" ]
+    }
+
+     deps = [
+      ":libwebrtc",
+      "//testing/gtest",
+      "//test:test_support",
+      "//test:test_main",
+    ]
   }
-
-   deps = [
-    ":libwebrtc",
-    "//testing/gtest",
-    "//test:test_support",
-    "//test:test_main",
-  ]
 }
