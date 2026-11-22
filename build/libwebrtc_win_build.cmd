@@ -91,23 +91,26 @@ if not exist src/libwebrtc (
   xcopy "%COMMAND_DIR%..\include" "src\libwebrtc\include" /E /I /Y
   xcopy "%COMMAND_DIR%..\src" "src\libwebrtc\src" /E /I /Y
   xcopy "%COMMAND_DIR%..\patches" "src\libwebrtc\patches" /E /I /Y
+  xcopy "%COMMAND_DIR%..\test" "src\libwebrtc\test" /E /I /Y
   copy "%COMMAND_DIR%..\BUILD.gn" "src\libwebrtc\"
   copy "%COMMAND_DIR%..\LICENSE" "src\libwebrtc\"
 )
 
 cd src
 copy .vpython3 ..
-call git apply "libwebrtc\patches\custom_audio_source_m144.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+call git apply "libwebrtc\patches\custom_audio_source_m150.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
 call git apply "libwebrtc\patches\add_libwebrtc_build_target.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+call git apply "libwebrtc\patches\allow_176k4_192k_shared_mode_formats.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
 cd ..
 
-if not exist "%ARTIFACTS_DIR%\lib" (
-  mkdir "%ARTIFACTS_DIR%\lib"
+
+rem Start from a clean artifacts directory so stale outputs are not shipped.
+if exist "%ARTIFACTS_DIR%" (
+  rmdir /s /q "%ARTIFACTS_DIR%"
 )
 
-if not exist "%ARTIFACTS_DIR%\include" (
-  mkdir "%ARTIFACTS_DIR%\include"
-)
+mkdir "%ARTIFACTS_DIR%\lib"
+mkdir "%ARTIFACTS_DIR%\include"
 
 set "debug=false"
 if "!profile!" == "debug" (

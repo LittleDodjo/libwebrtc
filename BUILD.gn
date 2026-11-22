@@ -27,13 +27,21 @@ if (is_linux) {
 
 config("external_config") {
   include_dirs = [ "include" ]
+  defines = []
   if (is_win) {
-    defines = [ "LIB_WEBRTC_API_DLL" ]
+    defines += [ "LIB_WEBRTC_API_DLL" ]
+  }
+
+  # The public headers declare extra virtual methods under this define, so
+  # dependents need it too to agree on the vtable layout.
+  if (libwebrtc_desktop_capture) {
+    defines += [ "RTC_DESKTOP_DEVICE" ]
   }
 }
 
 rtc_shared_library("libwebrtc") {
   libs = []
+  cflags = []
   include_dirs = [
     ".",
     "include",
@@ -77,6 +85,7 @@ rtc_shared_library("libwebrtc") {
     "include/rtc_data_packet_cryptor.h",
     "include/rtc_dtls_transport.h",
     "include/rtc_dtmf_sender.h",
+    "include/rtc_field_trials.h",
     "include/rtc_frame_cryptor.h",
     "include/rtc_ice_candidate.h",
     "include/rtc_media_stream.h",
@@ -93,6 +102,7 @@ rtc_shared_library("libwebrtc") {
     "include/rtc_types.h",
     "include/rtc_video_device.h",
     "include/rtc_video_frame.h",
+    "include/rtc_video_processor.h",
     "include/rtc_video_renderer.h",
     "include/rtc_video_source.h",
     "include/rtc_video_track.h",
@@ -129,6 +139,8 @@ rtc_shared_library("libwebrtc") {
     "src/rtc_dtls_transport_impl.h",
     "src/rtc_dtmf_sender_impl.cc",
     "src/rtc_dtmf_sender_impl.h",
+    "src/rtc_field_trials.cc",
+    "src/rtc_field_trials_impl.h",
     "src/rtc_frame_cryptor_impl.cc",
     "src/rtc_frame_cryptor_impl.h",
     "src/rtc_ice_candidate_impl.cc",
@@ -164,6 +176,7 @@ rtc_shared_library("libwebrtc") {
     "src/rtc_video_track_impl.cc",
     "src/rtc_video_track_impl.h",
     "src/rtc_logging.cc",
+    "src/rtc_logging_impl.h",
   ]
 
   # intel media sdk
@@ -254,19 +267,47 @@ rtc_shared_library("libwebrtc") {
     ]
   }
 
+  # WMF H.265 support (Windows without Intel Media SDK)
+  if (is_win && !libwebrtc_intel_media_sdk && rtc_use_h265) {
+    sources += [
+      "src/win/wmf_h265_encoder.cc",
+      "src/win/wmf_h265_encoder.h",
+      "src/win/wmf_h265_decoder.cc",
+      "src/win/wmf_h265_decoder.h",
+      "src/win/wmf_h265_factory.cc",
+      "src/win/wmf_h265_factory.h",
+    ]
+    libs += [
+      "mfplat.lib",
+      "mfuuid.lib",
+      "mf.lib",
+      "d3d11.lib",
+      "dxgi.lib",
+    ]
+  }
+
   if (is_win && is_clang) {
-    cflags = [
+    cflags += [
       "-Wno-microsoft-extra-qualification",
       "-Wno-reorder",
     ]
   }
+
   if (is_clang) {
     # Suppress warnings from the Chromium Clang plugin (bugs.webrtc.org/163).
     #suppressed_configs += [ "//build/config/clang:find_bad_constructs" ]
+
+    # Since m150 the unsafe-buffers clang plugin is enabled tree-wide (see
+    # //unsafe_buffers_paths.txt). The plugin re-raises the diagnostic as an
+    # error on its own, so -Wno-unsafe-buffer-usage alone is not enough; the
+    # config has to be dropped for this target.
+    suppressed_configs += [ "//build/config/clang:unsafe_buffers" ]
+    cflags += [ "-Wno-deprecated-declarations" ]
   }
 
   deps = [
     "../api:create_peerconnection_factory",
+    "../api:field_trials",
     "../api:libjingle_peerconnection_api",
     "../api/audio_codecs:builtin_audio_decoder_factory",
     "../api/audio_codecs:builtin_audio_encoder_factory",
@@ -300,7 +341,6 @@ rtc_shared_library("libwebrtc") {
 
   # screen capture device
   if (libwebrtc_desktop_capture) {
-    defines += [ "RTC_DESKTOP_DEVICE" ]
     sources += [
       "include/rtc_desktop_capturer.h",
       "include/rtc_desktop_device.h",
@@ -319,6 +359,13 @@ rtc_shared_library("libwebrtc") {
     deps += [
       "../modules/desktop_capture",
     ]
+    if (is_win) {
+      deps += [
+        "../rtc_base/win:get_activation_factory",
+        "../rtc_base/win:hstring",
+        "../rtc_base/win:scoped_com_initializer",
+      ]
+    }
     if (is_linux) {
       configs += [ ":gio" ]
     }
@@ -328,4 +375,27 @@ rtc_shared_library("libwebrtc") {
       ]
     }
   }
+}
+
+rtc_test("libwebrtc_cpp_api_unittests") {
+  testonly = true
+
+  sources = [
+     "test/field_trials.test.cc",
+     "test/peerconnection_factory.test.cc",
+     "test/video_processor.test.cc",
+  ]
+
+  if (is_clang) {
+    # See the comment in the "libwebrtc" target above.
+    suppressed_configs = [ "//build/config/clang:unsafe_buffers" ]
+    cflags = [ "-Wno-deprecated-declarations" ]
+  }
+
+   deps = [
+    ":libwebrtc",
+    "//testing/gtest",
+    "//test:test_support",
+    "//test:test_main",
+  ]
 }

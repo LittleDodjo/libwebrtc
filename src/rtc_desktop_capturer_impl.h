@@ -21,12 +21,16 @@
 #include "api/video/video_frame.h"
 #include "common_video/include/video_frame_buffer_pool.h"
 #include "include/rtc_desktop_capturer.h"
+#include "include/rtc_desktop_device.h"
 #include "include/rtc_types.h"
 #include "modules/desktop_capture/desktop_and_cursor_composer.h"
 #include "modules/desktop_capture/desktop_capture_options.h"
 #include "modules/desktop_capture/desktop_capturer.h"
 #include "modules/desktop_capture/desktop_frame.h"
 #include "rtc_base/thread.h"
+#ifdef WEBRTC_WIN
+#include "rtc_base/win/scoped_com_initializer.h"
+#endif
 #include "src/internal/vcm_capturer.h"
 #include "src/internal/video_capturer.h"
 #ifdef WEBRTC_WIN
@@ -43,6 +47,11 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
                          webrtc::DesktopCapturer::SourceId source_id,
                          webrtc::Thread* signaling_thread,
                          scoped_refptr<MediaSource> source, bool showCursor = true);
+  RTCDesktopCapturerImpl(DesktopType type,
+                         webrtc::DesktopCapturer::SourceId source_id,
+                         webrtc::Thread* signaling_thread,
+                         scoped_refptr<MediaSource> source,
+                         const RTCDesktopCapturerOptions& options);
   ~RTCDesktopCapturerImpl();
 
   void RegisterDesktopCapturerObserver(
@@ -64,6 +73,8 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
 
   scoped_refptr<MediaSource> source() override { return source_; }
 
+  bool IsCaptureBorderHidden() override { return border_hidden_; }
+
  protected:
   virtual void OnCaptureResult(
       webrtc::DesktopCapturer::Result result,
@@ -76,6 +87,8 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   // поднялась: тогда путь webrtc с обратным чтением BGRA не используется вовсе.
   std::unique_ptr<squeak::GpuScreenCapturer> gpu_capturer_;
 #endif
+  // Converts a frame from the Windows.Graphics.Capture capturer.
+  void OnWgcFrame(const webrtc::DesktopFrame& frame);
   webrtc::DesktopCaptureOptions options_;
   std::unique_ptr<webrtc::DesktopCapturer> capturer_;
   std::unique_ptr<webrtc::Thread> thread_;
@@ -104,6 +117,16 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   uint32_t y_ = 0;
   uint32_t w_ = 0;
   uint32_t h_ = 0;
+  bool focus_window_ = true;
+  // Whether capturer_ captures with Windows.Graphics.Capture. Set on thread_
+  // in the constructor.
+  bool use_wgc_ = false;
+  // Whether the WGC capture border is off. Set on thread_ in the constructor.
+  bool border_hidden_ = false;
+#ifdef WEBRTC_WIN
+  // WGC needs COM on the thread it runs on. Created and destroyed on thread_.
+  std::unique_ptr<webrtc::ScopedCOMInitializer> com_initializer_;
+#endif
 };
 
 }  // namespace libwebrtc
